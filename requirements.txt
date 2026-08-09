@@ -1,0 +1,7 @@
+numpy
+Pillow
+opencv-python
+redis
+python-dotenv
+psycopg2-binary
+boto3

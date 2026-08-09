@@ -1,0 +1,27 @@
+# Ignorar todo por defecto
+*
+
+# Re-incluir archivos raíz necesarios
+!.gitignore
+!requirements.txt
+!README.md
+!.env.example
+!worker_main.py
+!main.py
+
+# Paquete Python app
+!app/
+!app/**
+
+# Templates de productos
+!templates/
+!templates/**
+
+# Render passes (necesarios en el servidor)
+!data/
+!data/blender-passes/
+!data/blender-passes/**
+
+# Excluir caches incluso dentro de lo re-incluido
+**/__pycache__/
+**/*.pyc
