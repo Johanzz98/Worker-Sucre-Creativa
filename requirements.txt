@@ -5,3 +5,4 @@ redis
 python-dotenv
 psycopg2-binary
 boto3
+OpenEXR
