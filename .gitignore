@@ -8,6 +8,9 @@
 !.env.example
 !worker_main.py
 !main.py
+!app.py
+!Dockerfile
+!.dockerignore
 
 # Paquete Python app
 !app/

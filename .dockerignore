@@ -1,0 +1,11 @@
+.git
+.vscode
+.venv
+env
+__pycache__
+*.pyc
+.env
+mockup_worker.log
+nohup.out
+data/output
+data/downloads
