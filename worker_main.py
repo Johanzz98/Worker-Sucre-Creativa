@@ -27,6 +27,12 @@ except ImportError:
 # Cargar variables de entorno
 load_dotenv()
 
+# Asegurar UTF-8 en la consola (Windows usa cp1252 por defecto y los emojis rompen el logging)
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 # Configuración de logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -127,7 +133,7 @@ class MockupWorker:
                 "s3",
                 endpoint_url=self.r2_config["endpoint"],
                 aws_access_key_id=self.r2_config["access_key_id"],
-                aws_access_key_secret=self.r2_config["access_key_secret"],
+                aws_secret_access_key=self.r2_config["access_key_secret"],
                 region_name="auto",
             )
             logger.info("✅ R2 storage habilitado para subir mockups")
@@ -436,7 +442,21 @@ class MockupWorker:
                     self._update_job_status(job_id, "failed", error_msg)
                     return False
             else:
-                design_path = self.base_storage_path / design_key_normalized
+                # Si hay R2 configurado, el designKey es una clave dentro del bucket
+                # → descargarlo usando la URL pública
+                if self.r2_enabled:
+                    download_dir = self.python_app_path / "data" / "downloads"
+                    suffix = Path(design_key_normalized).suffix or ".png"
+                    design_path = download_dir / f"design_{job_id}{suffix}"
+                    design_url = f"{self.r2_config['public_url'].rstrip('/')}/{design_key_normalized}"
+                    logger.info(f"⬇️ Descargando diseño desde R2 (por key): {design_url}")
+                    if not self._r2_download(design_url, design_path):
+                        error_msg = f"No se pudo descargar el diseño desde R2: {design_key}"
+                        logger.error(f"❌ {error_msg}")
+                        self._update_job_status(job_id, "failed", error_msg)
+                        return False
+                else:
+                    design_path = self.base_storage_path / design_key_normalized
 
             if not design_path.exists():
                 error_msg = f"Diseño no encontrado: {design_key}"
