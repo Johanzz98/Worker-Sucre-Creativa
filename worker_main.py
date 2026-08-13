@@ -430,12 +430,17 @@ class MockupWorker:
 
             design_key_normalized = design_key.replace('\\', '/')
 
+            # Si el job trae un URL firmado del diseño, usarlo directamente
+            design_url = job_data.get("designUrl") or job_data.get("design_url")
+
             # Si design_key es una URL, descargarla desde R2
-            if design_key_normalized.startswith(("http://", "https://")):
+            if design_key_normalized.startswith(("http://", "https://")) or design_url:
                 download_dir = self.python_app_path / "data" / "downloads"
+                if design_url:
+                    design_key_normalized = design_url
                 suffix = Path(design_key_normalized).suffix or ".png"
                 design_path = download_dir / f"design_{job_id}{suffix}"
-                logger.info(f"⬇️ Descargando diseño desde R2: {design_key_normalized}")
+                logger.info(f"⬇️ Descargando diseño desde R2: {design_key_normalized[:120]}")
                 if not self._r2_download(design_key_normalized, design_path):
                     error_msg = f"No se pudo descargar el diseño desde R2: {design_key}"
                     logger.error(f"❌ {error_msg}")
