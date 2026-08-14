@@ -438,7 +438,7 @@ class MockupWorker:
                 download_dir = self.python_app_path / "data" / "downloads"
                 if design_url:
                     design_key_normalized = design_url
-                suffix = Path(design_key_normalized).suffix or ".png"
+                suffix = Path(design_key.replace('\\', '/')).suffix or ".png"
                 design_path = download_dir / f"design_{job_id}{suffix}"
                 logger.info(f"⬇️ Descargando diseño desde R2: {design_key_normalized[:120]}")
                 if not self._r2_download(design_key_normalized, design_path):
