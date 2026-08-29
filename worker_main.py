@@ -204,16 +204,17 @@ class MockupWorker:
 
     def get_uvmap_path(self, renders_path: Path) -> Path | None:
         """
-        Busca el archivo UVMap en la carpeta de renders
+        Busca el archivo UVMap en la carpeta de renders del ángulo.
         Soporta diferentes nombres: UVMap.exr, UVMap_centro.exr, etc.
+        (Cada ángulo tiene su propio UVMap.)
         """
         candidates = ["UVMap.exr", "UVMap_centro.exr", "UVMap_derecha.exr", "UVMap_izquierda.exr"]
-        
+
         for candidate in candidates:
             test_path = renders_path / candidate
             if test_path.exists():
                 return test_path
-        
+
         return None
 
     def _update_postgres(self, job_id: str, status: str, mockup_url: str = None):
@@ -310,6 +311,63 @@ class MockupWorker:
 
     def _r2_public_url(self, key: str) -> str:
         return f"{self.r2_config['public_url'].rstrip('/')}/{key}"
+
+    def _sync_renders_from_r2(self, product: str) -> bool:
+        """
+        Descarga los renders (Beauty/ID/UVMap por ángulo) desde R2
+        hacia la ruta local que el worker ya espera (data/blender-passes/...).
+        No cambia el pipeline: solo llena el disco local desde R2.
+
+        Cada ángulo tiene su propio Beauty.png, ID.png y UVMap.exr.
+
+        Devuelve False si R2 no está habilitado o no hay ángulos en BD para el
+        producto (en ese caso se mantiene el comportamiento actual: disco local).
+        """
+        if not self.r2_enabled:
+            logger.info("↩️  R2 no habilitado: usando renders locales")
+            return False
+
+        # Leer ángulos del asset desde BD (los guarda el backend al crear)
+        angles = []
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT angles FROM assets_3d WHERE model_key = %s", (product,))
+            row = cursor.fetchone()
+            cursor.close()
+            if row and row[0]:
+                angles = list(row[0])
+                logger.info(f"📐 Ángulos desde BD para {product}: {angles}")
+            else:
+                logger.warning(f"⚠️ No hay ángulos en BD para {product}")
+                return False
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudieron leer ángulos desde BD: {e}")
+            return False
+
+        if not angles:
+            return False
+
+        ok = True
+        for angle in angles:
+            angle_dir = self.get_render_path(product, angle)
+            angle_dir.mkdir(parents=True, exist_ok=True)
+
+            beauty_url = self._r2_public_url(f"renders/{product}/{angle}/Beauty.png")
+            id_url = self._r2_public_url(f"renders/{product}/{angle}/ID.png")
+            uvmap_url = self._r2_public_url(f"renders/{product}/{angle}/UVMap.exr")
+
+            if not self._r2_download(beauty_url, angle_dir / "Beauty.png"):
+                ok = False
+            if not self._r2_download(id_url, angle_dir / "ID.png"):
+                ok = False
+            if not self._r2_download(uvmap_url, angle_dir / "UVMap.exr"):
+                ok = False
+
+        if ok:
+            logger.info(f"✅ Renders sincronizados desde R2 para {product}")
+        else:
+            logger.warning(f"⚠️ Algunos renders no se pudieron descargar para {product}")
+        return ok
 
     def _run_mockup_generator(self, product: str, angle: str, design_path: Path, output_dir: Path, output_filename: str) -> bool:
         """Ejecutar el generador de mockups para un ángulo específico"""
@@ -470,7 +528,11 @@ class MockupWorker:
                 return False
 
             output_dir = self.python_app_path / "data" / "output"
-            
+
+            # Sincronizar renders desde R2 (si está habilitado y hay ángulos en BD).
+            # Si no baja nada, se mantiene el comportamiento actual: disco local.
+            self._sync_renders_from_r2(product)
+
             # Detectar ángulos disponibles para este producto
             angles = self.get_angles_for_product(product)
             
