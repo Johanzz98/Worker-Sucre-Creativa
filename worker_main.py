@@ -312,17 +312,40 @@ class MockupWorker:
     def _r2_public_url(self, key: str) -> str:
         return f"{self.r2_config['public_url'].rstrip('/')}/{key}"
 
-    def _sync_renders_from_r2(self, product: str) -> bool:
+    def _sync_renders_from_r2(self, product: str, renders: Dict = None) -> bool:
         """
-        Descarga los renders (Beauty/ID/UVMap por ángulo) desde R2
-        hacia la ruta local que el worker ya espera (data/blender-passes/...).
-        No cambia el pipeline: solo llena el disco local desde R2.
+        Descarga los renders (Beauty/ID/UVMap por ángulo) hacia la ruta local que el
+        worker ya espera (data/blender-passes/...). No cambia el pipeline: solo llena
+        el disco local.
 
-        Cada ángulo tiene su propio Beauty.png, ID.png y UVMap.exr.
+        Preferencia de origen:
+          1. URLS firmadas que vienen en el job (`renders` = {angle: {beauty, id, uvmap}}).
+             El bucket R2 no es público, así que las firmadas son la vía que funciona.
+          2. Si no hay renders en el job, se leen los ángulos desde BD y se intenta con
+             la URL pública (comportamiento anterior).
 
-        Devuelve False si R2 no está habilitado o no hay ángulos en BD para el
-        producto (en ese caso se mantiene el comportamiento actual: disco local).
+        Devuelve False si no hay ángulos disponibles para descargar.
         """
+        # Los ángulos vienen definidos por el propio payload de renders (si existe).
+        if renders:
+            ok = True
+            for angle, files in renders.items():
+                angle_dir = self.get_render_path(product, angle)
+                angle_dir.mkdir(parents=True, exist_ok=True)
+
+                if files.get("beauty") and not self._r2_download(files["beauty"], angle_dir / "Beauty.png"):
+                    ok = False
+                if files.get("id") and not self._r2_download(files["id"], angle_dir / "ID.png"):
+                    ok = False
+                if files.get("uvmap") and not self._r2_download(files["uvmap"], angle_dir / "UVMap.exr"):
+                    ok = False
+
+            if ok:
+                logger.info(f"✅ Renders sincronizados (URLs firmadas del job) para {product}")
+            else:
+                logger.warning(f"⚠️ Algunos renders no se pudieron descargar (URLs firmadas) para {product}")
+            return ok
+
         if not self.r2_enabled:
             logger.info("↩️  R2 no habilitado: usando renders locales")
             return False
@@ -529,9 +552,9 @@ class MockupWorker:
 
             output_dir = self.python_app_path / "data" / "output"
 
-            # Sincronizar renders desde R2 (si está habilitado y hay ángulos en BD).
+            # Sincronizar renders desde R2 (si el job trae URLs firmadas, esas mandan).
             # Si no baja nada, se mantiene el comportamiento actual: disco local.
-            self._sync_renders_from_r2(product)
+            self._sync_renders_from_r2(product, job_data.get("renders") or None)
 
             # Detectar ángulos disponibles para este producto
             angles = self.get_angles_for_product(product)
