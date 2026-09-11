@@ -11,12 +11,14 @@ class UVMapManager:
     """Maneja la carga de UV maps desde archivos EXR"""
     
     @staticmethod
-    def load_uv_map(render_passes_dir: str) -> Optional[np.ndarray]:
+    def load_uv_map(render_passes_dir: str, normalize: bool = True) -> Optional[np.ndarray]:
         """
         Carga UV map desde archivo EXR en el directorio de render passes
         
         Args:
             render_passes_dir: Directorio que contiene UVMap.exr
+            normalize: Normalizar canales a [0,1] (True). False conserva las
+                coordenadas absolutas del atlas (para regiones por master).
             
         Returns:
             Array numpy con UV map, o None si no existe
@@ -27,16 +29,18 @@ class UVMapManager:
             logger.error(f"UV Map no encontrado: {uv_exr_path}")
             return None
         
-        return EXRLoader.load_exr_file(uv_exr_path)
+        return EXRLoader.load_exr_file(uv_exr_path, normalize=normalize)
     
     @staticmethod
-    def load_uv_map_from_file(uvmap_file_path: str) -> Optional[np.ndarray]:
+    def load_uv_map_from_file(uvmap_file_path: str, normalize: bool = True) -> Optional[np.ndarray]:
         """
         Carga UV map desde una ruta de archivo específica
         (Útil para UVMaps compartidos entre múltiples orientaciones)
         
         Args:
             uvmap_file_path: Ruta completa al archivo UVMap.exr
+            normalize: Normalizar canales a [0,1] (True). False conserva las
+                coordenadas absolutas del atlas (para regiones por master).
             
         Returns:
             Array numpy con UV map, o None si no se puede cargar
@@ -49,7 +53,7 @@ class UVMapManager:
                 return None
             
             logger.info(f"📍 Cargando UV Map desde: {uvmap_path.name}")
-            uv_map = EXRLoader.load_exr_file(uvmap_path)
+            uv_map = EXRLoader.load_exr_file(uvmap_path, normalize=normalize)
             
             if uv_map is None:
                 logger.error(f"Error cargando UV Map: {uvmap_path}")

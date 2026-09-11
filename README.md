@@ -142,6 +142,41 @@ Ejemplo `mug_white_11oz.json`:
 # License
 MIT
 
+---
+
+## 🎬 Modo "render por partes" FRENTE/BACK (Blender)
+
+Para que los mockups de polera se vean **idénticos al preview GLB**: el worker
+hornea los diseños como textura (atlas plan A) y re-renderiza los 4 ángulos
+con Blender headless. Sin esto, el compositor repinta el diseño plano sobre el
+beauty y se nota sin sombreado ni el mapeo exacto del editor.
+
+### Variables de entorno
+
+| Variable | Valor | Efecto |
+|---|---|---|
+| `MOCKUP_RENDER_MODE` | `blender` | Activa el re-render con textura (default `compositor`) |
+| `BLENDER_BIN` | ruta al ejecutable | Deja el `blender` del PATH si se omite |
+| `POLERA_FRONTBACK_BLEND` | ruta al `.blend` de producción | Debe ser el blend re-UV (poleraNormaliMultiple). Si falta busca `data/blends/poleraNormaliMultiple.blend` |
+| `POLERA_RENDER_SIZE` | `2048` | Resolución cuadrada de los renders |
+| `POLERA_RENDER_TIMEOUT` | `600` | Segundos máx del render por pedido |
+
+Si falta Blender o el `.blend`, el worker **cae automáticamente al compositor**
+sin romper el job.
+
+### Archivos
+
+- `app/application/render_frontback.py` — atlas (numpy) + wrapper subprocess.
+- `blender/scripts/render_frontback_designs.py` — script bpy: textura en
+  `Polera_Frente`/`Polera_Atras`, `Polera_Restante` blanco, orbita la cámara
+  y renderiza `centro/derecha/izquierda/atras` (CYCLES).
+
+### En Docker
+
+La imagen base `python:3.11-slim` NO trae Blender. Para activar el modo
+re-render hay que instalar Blender en la imagen (p. ej. descargar el tarball
+oficial de blender.org en un stage y dejarlo en el PATH) y montar el `.blend`.
+
 ✔️ ¿Qué sigue?
 
 Si quieres te dejo también los archivos vacíos generados:

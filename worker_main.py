@@ -12,10 +12,14 @@ import urllib.request
 import http.server
 import socketserver
 import threading
+import numpy as np
 from psycopg2.extras import RealDictCursor
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
+
+from app.core.uv_manager import UVMapManager
+from app.application.render_frontback import render_frontback_designs
 
 # boto3 opcional: solo necesario si se usa R2 para subir los mockups
 try:
@@ -145,6 +149,12 @@ class MockupWorker:
                 logger.warning("⚠️ boto3 no instalado, R2 deshabilitado (pip install boto3)")
         
         self.render_url = os.getenv("RENDER_URL", "http://localhost:8000")
+
+        # Modo de generación de mockups: 'compositor' (UVMap + repintado) o
+        # 'blender' (render por partes: textura horneada + re-render). En modo
+        # 'blender' los mockups FRENTE/BACK se ven idénticos al preview GLB.
+        self.render_mode = os.getenv("MOCKUP_RENDER_MODE", "compositor").lower()
+        logger.info(f"🎬 MOCKUP_RENDER_MODE = {self.render_mode}")
         
         # Configuración de rutas
         self.python_app_path = Path(__file__).parent.resolve()
@@ -216,6 +226,78 @@ class MockupWorker:
                 return test_path
 
         return None
+
+    def get_zones_for_product(self, renders_path: Path) -> List[Dict]:
+        """
+        Detecta las zonas de impresión de un producto (multizona) escaneando
+        el directorio de renders del ángulo.
+
+        Una zona existe si aparece un ID_<key>.png (máscara occlusion-aware de
+        esa zona en este ángulo) junto al UVMap unificado (UVMap.exr): ambos son
+        el fragmento visible desde la cámara, así que el diseño se mapea con el
+        mismo UVMap pero restringido a la máscara de cada zona.
+        """
+        zones = []
+        uvmap = renders_path / "UVMap.exr"
+        if not uvmap.exists():
+            return zones
+        try:
+            for mask_file in renders_path.glob("ID_*.png"):
+                key = mask_file.stem.replace("ID_", "", 1)
+                if not key or key == "unified":
+                    continue
+                zones.append({
+                    "key": key,
+                    "uvmap": str(uvmap),
+                    "mask": str(mask_file),
+                })
+            if zones:
+                logger.info(f"🧩 Zonas multizona detectadas en {renders_path}: "
+                            f"{[z['key'] for z in zones]}")
+            return zones
+        except Exception as e:
+            logger.error(f"❌ Error detectando zonas en {renders_path}: {e}")
+            return []
+
+    # Plan A (reuv_polera_separado.py): frente en la mitad izquierda del atlas,
+    # atras en la derecha. Coincide con el aspect de los canvas del editor
+    # (402x420 frente, 420x420 atras) para que el diseño llene la superficie.
+    PLAN_A_REGIONS = {
+        "frente": {"umin": 0.020, "umax": 0.480, "vmin": 0.259, "vmax": 0.741},
+        "atras":  {"umin": 0.520, "umax": 0.980, "vmin": 0.270, "vmax": 0.730},
+    }
+
+    def get_surface_regions(self, product: str) -> List[Dict]:
+        """
+        Detecta las superficies FRENTE/BACK de un producto a partir de sus
+        MASTERS UV (renders/<product>/UVMap_frente.exr, UVMap_atras.exr).
+
+        Cada superficie se define por la región UV (bbox) que ocupa su isla en
+        el atlas (las mitades del plan A son disjuntas). El worker compone cada
+        diseño dentro de su región, sin necesidad de máscaras por zona.
+        """
+        if product.startswith("taza_"):
+            product_folder = self.python_app_path / "data" / "blender-passes" / "taza" / product
+        else:
+            product_folder = self.python_app_path / "data" / "blender-passes" / product
+
+        if not product_folder.exists():
+            logger.warning(f"⚠️ Carpeta de producto no existe para superficies: {product_folder}")
+            return []
+
+        surfaces = []
+        for key, region in self.PLAN_A_REGIONS.items():
+            master = product_folder / f"UVMap_{key}.exr"
+            if not master.exists():
+                logger.warning(f"⚠️ Master no encontrado: {master}")
+                continue
+            surfaces.append({"key": key, "region": dict(region)})
+            logger.info(f"🧩 Superficie '{key}' | region U[{region['umin']:.4f},{region['umax']:.4f}] "
+                        f"V[{region['vmin']:.4f},{region['vmax']:.4f}]")
+
+        if not surfaces:
+            logger.warning(f"⚠️ No se detectaron superficies (masters) para {product}")
+        return surfaces
 
     def _update_postgres(self, job_id: str, status: str, mockup_url: str = None):
         """Actualizar mockups y cart_items en PostgreSQL"""
@@ -312,17 +394,19 @@ class MockupWorker:
     def _r2_public_url(self, key: str) -> str:
         return f"{self.r2_config['public_url'].rstrip('/')}/{key}"
 
-    def _sync_renders_from_r2(self, product: str, renders: Dict = None) -> bool:
+    def _sync_renders_from_r2(self, product: str, renders: Dict = None, masters: List = None) -> bool:
         """
-        Descarga los renders (Beauty/ID/UVMap por ángulo) hacia la ruta local que el
-        worker ya espera (data/blender-passes/...). No cambia el pipeline: solo llena
-        el disco local.
+        Descarga los renders (Beauty/ID/UVMap por ángulo) y los MASTERS por
+        superficie (UVMap_frente.exr / UVMap_atras.exr) hacia la ruta local que
+        el worker ya espera (data/blender-passes/...). No cambia el pipeline:
+        solo llena el disco local.
 
         Preferencia de origen:
-          1. URLS firmadas que vienen en el job (`renders` = {angle: {beauty, id, uvmap}}).
-             El bucket R2 no es público, así que las firmadas son la vía que funciona.
-          2. Si no hay renders en el job, se leen los ángulos desde BD y se intenta con
-             la URL pública (comportamiento anterior).
+          1. URLS firmadas que vienen en el job (`renders` = {angle: {...}} y
+             `masters` = [{key, url}]). El bucket R2 no es público, así que las
+             firmadas son la vía que funciona.
+          2. Si no hay renders en el job, se leen los ángulos desde BD y se
+             intenta con la URL pública (comportamiento anterior).
 
         Devuelve False si no hay ángulos disponibles para descargar.
         """
@@ -333,21 +417,59 @@ class MockupWorker:
                 angle_dir = self.get_render_path(product, angle)
                 angle_dir.mkdir(parents=True, exist_ok=True)
 
-                if files.get("beauty") and not self._r2_download(files["beauty"], angle_dir / "Beauty.png"):
+                # No pisar renders locales existentes: si la carpeta ya tiene el
+                # archivo, se respeta (los locales corregidos mandan sobre los firmados).
+                def _sync(kind: str, local_name: str):
+                    url = files.get(kind)
+                    dest = angle_dir / local_name
+                    if dest.exists():
+                        logger.info(f"↩️  {local_name} ya existe local, se respeta (producto {product})")
+                        return True
+                    if not url:
+                        return True
+                    return self._r2_download(url, dest)
+
+                if not _sync("beauty", "Beauty.png"):
                     ok = False
-                if files.get("id") and not self._r2_download(files["id"], angle_dir / "ID.png"):
+                if not _sync("id", "ID.png"):
                     ok = False
-                if files.get("uvmap") and not self._r2_download(files["uvmap"], angle_dir / "UVMap.exr"):
+                if not _sync("uvmap", "UVMap.exr"):
                     ok = False
+
+                # Multizona: máscaras por zona (ID_<zone>.png) vía URLs firmadas del job.
+                # Formato A: files.masks = {zone: url}. Formato B: files.mask_<zone> = url.
+                masks = files.get("masks") if isinstance(files, dict) else None
+                if isinstance(masks, dict):
+                    for zone, url in masks.items():
+                        if not url:
+                            continue
+                        local_name = f"ID_{zone}.png"
+                        dest = angle_dir / local_name
+                        if not dest.exists() and self._r2_download(url, dest):
+                            logger.info(f"   ✓ Máscara de zona: {local_name}")
+                elif isinstance(files, dict):
+                    for field_key, url in files.items():
+                        if field_key.startswith("mask_") and url:
+                            zone = field_key[len("mask_"):]
+                            if not zone or (zone in ("beauty", "id", "uvmap")):
+                                continue
+                            local_name = f"ID_{zone}.png"
+                            dest = angle_dir / local_name
+                            if not dest.exists() and self._r2_download(url, dest):
+                                logger.info(f"   ✓ Máscara de zona: {local_name}")
 
             if ok:
                 logger.info(f"✅ Renders sincronizados (URLs firmadas del job) para {product}")
             else:
                 logger.warning(f"⚠️ Algunos renders no se pudieron descargar (URLs firmadas) para {product}")
+
+            # Masters UV por superficie (UVMap_frente/atras.exr) vía URLs firmadas.
+            self._sync_masters(product, masters)
             return ok
 
         if not self.r2_enabled:
             logger.info("↩️  R2 no habilitado: usando renders locales")
+            # Masters vía disco local (ya presentes) o descarta.
             return False
 
         # Leer ángulos del asset desde BD (los guarda el backend al crear)
@@ -370,6 +492,21 @@ class MockupWorker:
         if not angles:
             return False
 
+        # Zonas multizona del asset (metadata.printZones) para bajar sus máscaras
+        # (renders/<product>/<angle>/ID_<zone>.png) junto con Beauty/ID/UVMap.
+        print_zones: list = []
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT metadata FROM assets_3d WHERE model_key = %s", (product,))
+            row = cursor.fetchone()
+            cursor.close()
+            meta = row[0] if row and row[0] else {}
+            pz = (meta or {}).get("printZones") if isinstance(meta, dict) else None
+            if isinstance(pz, list):
+                print_zones = [z.get("key") if isinstance(z, dict) else z for z in pz]
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudieron leer printZones desde BD: {e}")
+
         ok = True
         for angle in angles:
             angle_dir = self.get_render_path(product, angle)
@@ -379,20 +516,91 @@ class MockupWorker:
             id_url = self._r2_public_url(f"renders/{product}/{angle}/ID.png")
             uvmap_url = self._r2_public_url(f"renders/{product}/{angle}/UVMap.exr")
 
-            if not self._r2_download(beauty_url, angle_dir / "Beauty.png"):
+            # No pisar renders locales existentes (los locales corregidos mandan).
+            def _sync_public(url: str, local_name: str):
+                dest = angle_dir / local_name
+                if dest.exists():
+                    logger.info(f"↩️  {local_name} ya existe local, se respeta (producto {product})")
+                    return True
+                return self._r2_download(url, dest)
+
+            if not _sync_public(beauty_url, "Beauty.png"):
                 ok = False
-            if not self._r2_download(id_url, angle_dir / "ID.png"):
+            if not _sync_public(id_url, "ID.png"):
                 ok = False
-            if not self._r2_download(uvmap_url, angle_dir / "UVMap.exr"):
+            if not _sync_public(uvmap_url, "UVMap.exr"):
                 ok = False
+
+            # Multizona: bajar máscaras por zona (ID_<zone>.png)
+            for zone in print_zones:
+                if not zone:
+                    continue
+                mask_url = self._r2_public_url(f"renders/{product}/{angle}/ID_{zone}.png")
+                _sync_public(mask_url, f"ID_{zone}.png")
 
         if ok:
             logger.info(f"✅ Renders sincronizados desde R2 para {product}")
         else:
             logger.warning(f"⚠️ Algunos renders no se pudieron descargar para {product}")
+
+        # Masters por superficie en modo público (renders/<product>/UVMap_<key>.exr).
+        self._sync_masters(product, masters)
         return ok
 
-    def _run_mockup_generator(self, product: str, angle: str, design_path: Path, output_dir: Path, output_filename: str) -> bool:
+    def _sync_masters(self, product: str, masters: List = None):
+        """
+        Descarga los masters UV por superficie (renders/<product>/UVMap_<key>.exr)
+        hacia data/blender-passes/<product>/UVMap_<key>.exr. En modo firmado usa
+        las URLs del job (`masters` = [{key, url}]); en modo público usa la URL
+        determinista del bucket.
+        """
+        if product.startswith("taza_"):
+            product_folder = self.python_app_path / "data" / "blender-passes" / "taza" / product
+        else:
+            product_folder = self.python_app_path / "data" / "blender-passes" / product
+        product_folder.mkdir(parents=True, exist_ok=True)
+
+        if masters:
+            for m in masters:
+                key = m.get("key")
+                url = m.get("url")
+                if not key or not url:
+                    continue
+                dest = product_folder / f"UVMap_{key}.exr"
+                if dest.exists():
+                    logger.info(f"↩️  UVMap_{key}.exr ya existe local, se respeta")
+                    continue
+                if self._r2_download(url, dest):
+                    logger.info(f"✅ Master sincronizado: UVMap_{key}.exr")
+            return
+
+        # Modo público (fallback): key determinista renders/<product>/UVMap_<key>.exr
+        if not self.r2_enabled:
+            return
+        try:
+            for key in ("frente", "atras"):
+                dest = product_folder / f"UVMap_{key}.exr"
+                if dest.exists():
+                    continue
+                url = self._r2_public_url(f"renders/{product}/UVMap_{key}.exr")
+                if self._r2_download(url, dest):
+                    logger.info(f"✅ Master sincronizado (público): UVMap_{key}.exr")
+        except Exception as e:
+            logger.warning(f"⚠️ Error sincronizando masters (público): {e}")
+
+    def _resolve_product_type(self, product: str) -> Optional[str]:
+        """Resuelve el product_type del asset (assets_3d.product_type) desde PostgreSQL."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT product_type FROM assets_3d WHERE model_key = %s", (product,))
+            row = cursor.fetchone()
+            cursor.close()
+            return str(row[0]) if row and row[0] else None
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo resolver product_type para {product}: {e}")
+            return None
+
+    def _run_mockup_generator(self, product: str, angle: str, design_path: Path, output_dir: Path, output_filename: str, print_zone: Optional[Dict] = None, zones: Optional[List[Dict]] = None, design_back_path: Optional[Path] = None) -> bool:
         """Ejecutar el generador de mockups para un ángulo específico"""
         try:
             # Construir ruta dinámica para este producto y ángulo
@@ -435,11 +643,16 @@ class MockupWorker:
                 sys.executable,
                 str(main_script),
                 "--product", product,
+                "--product-type", self._resolve_product_type(product) or "",
                 "--design", str(design_path.absolute()),
                 "--render_passes", str(renders_path.absolute()),
                 "--output", str(output_dir.absolute()),
                 "--output-name", output_filename
             ]
+
+            if design_back_path and design_back_path.exists():
+                cmd.extend(["--design-back", str(design_back_path.absolute())])
+                logger.info(f"   ✓ Design trasero: {design_back_path.name}")
             
             # Buscar UVMap específico para este ángulo
             uvmap_path = self.get_uvmap_path(renders_path)
@@ -448,6 +661,18 @@ class MockupWorker:
                 logger.info(f"   ✓ UVMap: {uvmap_path.name}")
             else:
                 logger.warning(f"⚠️ UVMap no encontrado en {renders_path}")
+
+            # Pasar zonas (multizona o superficies FRENTE/BACK) si las hay
+            if zones:
+                import json as _json
+                cmd.extend(["--zones", _json.dumps(zones)])
+                logger.info(f"   ✓ Zonas ({len(zones)}): {[z['key'] for z in zones]}")
+
+            # Pasar print zone si el producto lo define en el job
+            if print_zone:
+                import json as _json
+                cmd.extend(["--print-zone", _json.dumps(print_zone)])
+                logger.info(f"   ✓ Print zone: {print_zone}")
             
             logger.info(f"🔄 Ejecutando comando:")
             logger.info(f"   {' '.join(cmd)}")
@@ -550,11 +775,44 @@ class MockupWorker:
                 self._update_job_status(job_id, "failed", error_msg)
                 return False
 
+            # --- Diseño de la superficie ATRÁS (opcional) ---
+            design_back_path = None
+            design_back_key = job_data.get("designBackKey")
+            design_back_url = job_data.get("designBackUrl") or job_data.get("design_back_url")
+            if design_back_key or design_back_url:
+                dl_dir = self.python_app_path / "data" / "downloads"
+                dl_dir.mkdir(parents=True, exist_ok=True)
+                suffix = Path((design_back_key or "back.png").replace('\\', '/')).suffix or ".png"
+                design_back_path = dl_dir / f"design_back_{job_id}{suffix}"
+
+                if design_back_url:
+                    src = design_back_url
+                elif design_back_key.startswith(("http://", "https://")):
+                    src = design_back_key
+                elif self.r2_enabled:
+                    src = f"{self.r2_config['public_url'].rstrip('/')}/{design_back_key}"
+                else:
+                    src = self.base_storage_path / design_back_key
+                    if not Path(src).exists():
+                        error_msg = f"Diseño trasero no encontrado: {design_back_key}"
+                        logger.error(f"❌ {error_msg}")
+                        self._update_job_status(job_id, "failed", error_msg)
+                        return False
+
+                logger.info(f"⬇️ Descargando diseño trasero: {str(src)[:120]}")
+                if self._r2_download(str(src), design_back_path):
+                    logger.info(f"✅ Diseño trasero descargado: {design_back_path}")
+                else:
+                    error_msg = f"No se pudo descargar el diseño trasero: {design_back_key}"
+                    logger.error(f"❌ {error_msg}")
+                    self._update_job_status(job_id, "failed", error_msg)
+                    return False
+
             output_dir = self.python_app_path / "data" / "output"
 
             # Sincronizar renders desde R2 (si el job trae URLs firmadas, esas mandan).
             # Si no baja nada, se mantiene el comportamiento actual: disco local.
-            self._sync_renders_from_r2(product, job_data.get("renders") or None)
+            self._sync_renders_from_r2(product, job_data.get("renders") or None, job_data.get("masters") or None)
 
             # Detectar ángulos disponibles para este producto
             angles = self.get_angles_for_product(product)
@@ -584,13 +842,55 @@ class MockupWorker:
             
             mockup_urls = []
             failed_angles = []
-            
+
+            # Print zone del producto (opcional) para recortar el diseño a la superficie real
+            print_zone = job_data.get("printZone") or job_data.get("metadata", {}).get("printZone")
+
+            # Zonas de composición. Modelo FRENTE/BACK (job con 2 diseños): las
+            # superficies se segmentan por la región UV de cada master
+            # (UVMap_frente/atras.exr) sin máscaras. Modelo heredado: multizona
+            # desde el primer ángulo con renders (UVMap_<key>.exr + ID_<key>.png).
+            design_back_active = design_back_key is not None or design_back_url is not None
+            zones = []
+            surface_masters = self.get_surface_regions(product)
+            if surface_masters:
+                zones = surface_masters
+                logger.info(f"👇 Producto {product}: {len(zones)} superficies (FRENTE/BACK por región UV)")
+            else:
+                for angle in angles:
+                    probes = self.get_render_path(product, angle)
+                    zones = self.get_zones_for_product(probes)
+                    if zones:
+                        break
+                if zones:
+                    logger.info(f"👇 Producto {product}: {len(zones)} zonas de impresión")
+
+            # Modo BLENDER (render por partes): re-renderiza los ángulos con el
+            # diseño horneado como textura -> idéntico al preview GLB. Si no se
+            # puede usar Blender, cae al compositor.
+            render_by_angle = None
+            if self.render_mode == "blender" and design_back_active and design_path.exists():
+                render_by_angle = render_frontback_designs(design_path, design_back_path, output_dir)
+                if render_by_angle:
+                    logger.info(f"🎬 Modo BLENDER FRENTE/BACK: {len(render_by_angle)} ángulos re-renderizados")
+                else:
+                    logger.warning("➡️ Blender no disponible; usando compositor")
+
             for index, angle in enumerate(angles, 1):
                 try:
                     logger.info(f"🔄 [{index}/{len(angles)}] Generando ángulo: {angle}")
-                    
+
                     output_filename = f"mockup_{job_id}_{product}_{angle}.png"
-                    success = self._run_mockup_generator(product, angle, design_path, output_dir, output_filename)
+
+                    if render_by_angle and angle in render_by_angle:
+                        # Re-render con diseño horneado (textura real, misma que el GLB)
+                        mockup_file = output_dir / output_filename
+                        shutil.copy2(render_by_angle[angle], mockup_file)
+                        success = mockup_file.exists()
+                        if success:
+                            logger.info(f"✅ [{index}/{len(angles)}] Mockup (Blender): {angle}")
+                    else:
+                        success = self._run_mockup_generator(product, angle, design_path, output_dir, output_filename, print_zone=print_zone, zones=zones, design_back_path=design_back_path)
                     
                     if success:
                         mockup_file = output_dir / output_filename

@@ -13,7 +13,9 @@ class SimpleCompositor:
     
     @staticmethod
     def create_mockup(beauty: np.ndarray, design: np.ndarray, 
-                     uv_map: np.ndarray, mask: np.ndarray) -> np.ndarray:
+                     uv_map: np.ndarray, mask: np.ndarray,
+                     flip_vertical: bool = True,
+                     aspect_factor: float = 1.0) -> np.ndarray:
         """
         Genera mockup extrayendo iluminación del beauty pass
         
@@ -22,6 +24,14 @@ class SimpleCompositor:
             design: Diseño del usuario
             uv_map: UV map del producto
             mask: Máscara de la región de diseño
+            flip_vertical: Voltear el diseño verticalmente (coordenadas UV).
+                True para tazas (histórico), False para poleras/otros.
+            aspect_factor: Factor de corrección de proporción de aspecto.
+                Multiplica el muestreo horizontal (U) del diseño. Un valor < 1
+                hace que el diseño se vea más estrecho (menos ancho), compensando
+                el estiramiento horizontal generado por la relación U/V del UVMap.
+                Se mide con un test de cuadrado negro: si un cuadrado de diseño se
+                ve como w×h con w/h = R, el factor correcto es 1/R.
             
         Returns:
             Mockup final con diseño integrado
@@ -34,11 +44,11 @@ class SimpleCompositor:
             logger.info(f"🔧 Redimensionando UV Map de {uv_map.shape[1]}x{uv_map.shape[0]} a {w}x{h}")
             uv_map = cv2.resize(uv_map, (w, h), interpolation=cv2.INTER_LINEAR)
         
-        # 1. Voltear diseño verticalmente (coordinadas UV)
-        design_flipped = np.flipud(design)
+        # 1. Voltear diseño verticalmente (coordinadas UV) según el producto
+        design_flipped = np.flipud(design) if flip_vertical else design
         
         # 2. Aplicar diseño a través del UV map (CON FIX DE BORDES)
-        design_applied = SimpleCompositor._apply_design_simple(design_flipped, uv_map, mask)
+        design_applied = SimpleCompositor._apply_design_simple(design_flipped, uv_map, mask, aspect_factor)
         
         # 3. Extraer iluminación del beauty y aplicarla al diseño
         result = SimpleCompositor._blend_with_lighting(beauty, design_applied, mask)
@@ -46,7 +56,224 @@ class SimpleCompositor:
         return result
     
     @staticmethod
-    def _apply_design_simple(design: np.ndarray, uv_map: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    def create_mockup_multi(beauty: np.ndarray, design: np.ndarray,
+                            zones: list, flip_vertical: bool = True,
+                            aspect_factor: float = 1.0) -> np.ndarray:
+        """
+        Genera mockup componiendo el diseño en MÚLTIPLES zonas de impresión.
+
+        A diferencia de create_mockup (una sola zona), aquí cada zona aporta su
+        máscara occlusion-aware (qué píxeles muestra esa zona desde la cámara)
+        y su UVMap. Las zonas son disjuntas en pantalla (el pixel más cercano a
+        cámara pertenece a una sola malla), así que se suman sus contribuciones
+        sobre el beauty original.
+
+        Args:
+            beauty: Beauty pass con iluminación completa
+            design: Diseño del usuario
+            zones: Lista de dicts {'uv_map': (H,W,3) [0,1], 'mask': (H,W) 2D [0,1]}
+            flip_vertical: Voltear el diseño verticalmente (coordenadas UV)
+            aspect_factor: Corrección de proporción de aspecto
+
+        Returns:
+            Mockup final con diseño integrado en todas las zonas
+        """
+        logger.info(f"🎨 Compositor MULTIZONA - pasando por {len(zones)} zonas")
+        h, w = beauty.shape[:2]
+        design_flipped = np.flipud(design) if flip_vertical else design
+
+        smooth_masks = []
+        prepared = []
+        for z in zones:
+            m = z['mask']
+            if m.ndim == 3:
+                m = np.mean(m, axis=2)
+            uv = z['uv_map']
+            if uv.shape[:2] != (h, w):
+                uv = cv2.resize(uv, (w, h), interpolation=cv2.INTER_LINEAR)
+            if m.shape[:2] != (h, w):
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+            smooth_masks.append(SimpleCompositor._smooth_mask(m, blur_size=9))
+            prepared.append({'uv_map': uv, 'mask': m})
+
+        union = np.maximum.reduce(smooth_masks)
+        union_region = union > 0.5
+
+        if np.any(union_region):
+            b_in = beauty[union_region]
+            white_base = np.array([
+                np.percentile(b_in[:, 0], 90),
+                np.percentile(b_in[:, 1], 90),
+                np.percentile(b_in[:, 2], 90),
+            ])
+            logger.info(f"⚪ Material base MULTIZONA detectado: RGB{tuple(round(c, 3) for c in white_base)}")
+        else:
+            white_base = np.array([0.9, 0.9, 0.9])
+            logger.warning("⚠️ Sin región UV multizona, usando blanco estándar")
+
+        lighting = np.clip(beauty / np.maximum(white_base, 0.01)[np.newaxis, np.newaxis, :], 0.2, 1.8)
+
+        design_lit = np.zeros_like(beauty, dtype=np.float32)
+        for z, sm in zip(prepared, smooth_masks):
+            dm = SimpleCompositor._apply_design_simple(design_flipped, z['uv_map'], z['mask'], aspect_factor)
+            design_lit += dm * lighting * sm[:, :, np.newaxis]
+
+        result = beauty * (1.0 - union[:, :, np.newaxis]) + design_lit
+        result = np.clip(result, 0.0, 1.0)
+
+        logger.info(f"✅ Composición MULTIZONA completada")
+        logger.info(f"   Output range: [{result.min():.3f}, {result.max():.3f}]")
+        return result
+
+    @staticmethod
+    def create_mockup_surfaces(beauty: np.ndarray, zones: list, flip_vertical: bool = True) -> np.ndarray:
+        """
+        Genera mockup componiendo UN diseño por superficie usando SOLO la región
+        UV de cada superficie (modelo FRENTE/BACK, sin máscaras por zona).
+
+        Las superficies del producto se segmentan por su región UV en el atlas
+        (derivada de los masters UVMap_frente.exr / UVMap_atras.exr). Cada zona
+        es un diccionario:
+            {
+                'uv_map': (H,W,3) [0,1]   # UVMap unificado del ángulo
+                'region': {'umin','umax','vmin','vmax'}  # bbox de la superficie
+                'design': (H,W,C) [0,1]   # diseño de ESA superficie
+                'aspect_factor': float    # (opcional) corrección de aspecto
+            }
+        El diseño de cada superficie se muestrea normalizado a su región, de modo
+        que llena exactamente la malla de esa superficie sin deformarse (si el
+        lienzo del editor tiene el mismo aspecto que la región).
+        """
+        logger.info(f"🎨 Compositor SUPERFICIES - {len(zones)} superficies por región UV")
+        h, w = beauty.shape[:2]
+
+        smooth_masks = []
+        prepared = []
+        for z in zones:
+            region = z['region']
+            m = SimpleCompositor._mask_from_region(z['uv_map'], region)
+            if m.shape[:2] != (h, w):
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+            uv = z['uv_map']
+            if uv.shape[:2] != (h, w):
+                uv = cv2.resize(uv, (w, h), interpolation=cv2.INTER_LINEAR)
+            smooth_masks.append(SimpleCompositor._smooth_mask(m, blur_size=9))
+            prepared.append({'design': z['design'], 'uv_map': uv, 'mask': m,
+                             'region': z['region'], 'aspect_factor': z.get('aspect_factor', 1.0)})
+
+        union = np.maximum.reduce(smooth_masks)
+        union_region = union > 0.5
+
+        if np.any(union_region):
+            b_in = beauty[union_region]
+            white_base = np.array([
+                np.percentile(b_in[:, 0], 90),
+                np.percentile(b_in[:, 1], 90),
+                np.percentile(b_in[:, 2], 90),
+            ])
+            logger.info(f"⚪ Material base SUPERFICIES detectado: RGB{tuple(round(c, 3) for c in white_base)}")
+        else:
+            white_base = np.array([0.9, 0.9, 0.9])
+            logger.warning("⚠️ Sin región UV, usando blanco estándar")
+
+        lighting = np.clip(beauty / np.maximum(white_base, 0.01)[np.newaxis, np.newaxis, :], 0.2, 1.8)
+
+        design_lit = np.zeros_like(beauty, dtype=np.float32)
+        for z, sm in zip(prepared, smooth_masks):
+            design = z['design']
+            design_flipped = np.flipud(design) if flip_vertical else design
+            dm = SimpleCompositor._apply_design_simple(
+                design_flipped, z['uv_map'], z['mask'],
+                aspect_factor=z['aspect_factor'], region=z['region'],
+            )
+            design_lit += dm * lighting * sm[:, :, np.newaxis]
+
+        result = beauty * (1.0 - union[:, :, np.newaxis]) + design_lit
+        result = np.clip(result, 0.0, 1.0)
+
+        logger.info(f"✅ Composición SUPERFICIES completada")
+        return result
+
+    @staticmethod
+    def _mask_from_region(uv_map: np.ndarray, region: dict) -> np.ndarray:
+        """
+        Máscara binaria 2D de una superficie: píxeles cuyo UV cae dentro de la
+        región (bbox) de esa superficie en el atlas. Las superficies del plan A
+        son disjuntas en UV (mitades del atlas), así que la clasificación por
+        región no deja píxeles ambiguos.
+        """
+        U = uv_map[:, :, 0]
+        V = uv_map[:, :, 1]
+        m = (
+            (U >= region['umin']) & (U <= region['umax'])
+            & (V >= region['vmin']) & (V <= region['vmax'])
+        )
+        return m.astype(np.float32)
+
+    @staticmethod
+    def _smooth_mask(mask: np.ndarray, erode_iterations: int = 2, blur_size: int = 9) -> np.ndarray:
+        """Máscara erosionada y suavizada (reutilizada por blend y multizona)"""
+        g = mask if mask.ndim == 2 else np.mean(mask, axis=2)
+        kernel = np.ones((3, 3), np.uint8)
+        er = cv2.erode((g * 255).astype(np.uint8), kernel, iterations=erode_iterations)
+        er = er.astype(np.float32) / 255.0
+        return cv2.GaussianBlur(er, (blur_size, blur_size), 0)
+
+    @staticmethod
+    def crop_to_print_zone(design: np.ndarray, print_zone: dict) -> np.ndarray:
+        """
+        Recorta el diseño a la zona de impresión del producto.
+
+        El print_zone viene como rect normalizado [0,1] relativo al diseño completo
+        (el canvas del editor). Recorta la región central correspondiente y la
+        devuelve, de modo que ese rect llena exactamente la superficie a imprimir.
+
+        Args:
+            design: Diseño cargado (H, W, C) en [0,1]
+            print_zone: {x, y, width, height} normalizados [0,1] (x,y = centro o esquina
+                según 'origin'; por defecto se interpreta x,y como centro del rect).
+
+        Returns:
+            Diseño recortado (tamaño nuevo). Si print_zone inválido, devuelve design sin cambios.
+        """
+        try:
+            h, w = design.shape[:2]
+
+            origin = print_zone.get("origin", "center")
+            width = float(print_zone.get("width", 1.0))
+            height = float(print_zone.get("height", 1.0))
+            px = float(print_zone.get("x", 0.5))
+            py = float(print_zone.get("y", 0.5))
+
+            if width <= 0 or height <= 0 or width > 2 or height > 2:
+                logger.warning(f"⚠️ print_zone inválido (w={width}, h={height}), se ignora")
+                return design
+
+            cw = max(1, int(round(w * width)))
+            ch = max(1, int(round(h * height)))
+
+            if origin == "center":
+                cx = int(round(px * w))
+                cy = int(round(py * h))
+                x0 = max(0, min(w - cw, int(cx - cw / 2)))
+                y0 = max(0, min(h - ch, int(cy - ch / 2)))
+            else:  # top-left
+                x0 = max(0, min(w - cw, int(round(px * w))))
+                y0 = max(0, min(h - ch, int(round(py * h))))
+
+            crop = design[y0:y0 + ch, x0:x0 + cw]
+            if crop.size == 0:
+                logger.warning("⚠️ print_zone produjo recorte vacío, se ignora")
+                return design
+            return crop
+        except Exception as e:
+            logger.warning(f"⚠️ Error aplicando print_zone: {e}")
+            return design
+
+    @staticmethod
+    def _apply_design_simple(design: np.ndarray, uv_map: np.ndarray, mask: np.ndarray,
+                            aspect_factor: float = 1.0,
+                            region: dict | None = None) -> np.ndarray:
         """
         Mapea el diseño usando coordenadas UV CON EROSIÓN DE MÁSCARA
         
@@ -54,7 +281,12 @@ class SimpleCompositor:
             design: Diseño volteado verticalmente
             uv_map: Mapa UV normalizado [0,1]
             mask: Máscara para erosionar bordes
-            
+            aspect_factor: Corrección de proporción de aspecto (multiplica U).
+                < 1 estrecha el diseño horizontalmente.
+            region: Bbox {'umin','umax','vmin','vmax'} de la superficie en el
+                atlas. Si se define, el diseño se muestrea NORMALIZADO a esa
+                región (el diseño completo llena la malla de la superficie).
+
         Returns:
             Diseño mapeado al render
         """
@@ -68,13 +300,25 @@ class SimpleCompositor:
         V = uv_map[:, :, 1]
         design_h, design_w = design.shape[:2]
         
+        # Normalización a la región de la superficie si se define (modelo FRENTE/BACK):
+        # el diseño llena la bbox de la región, no el atlas completo.
+        if region:
+            umin, umax = region['umin'], region['umax']
+            vmin, vmax = region['vmin'], region['vmax']
+            U = np.clip((U - umin) / max(umax - umin, 1e-6), 0.0, 1.0)
+            V = np.clip((V - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
+            logger.info(f"📏 UV Mapping por región: U[{umin:.3f},{umax:.3f}] V[{vmin:.3f},{vmax:.3f}]")
+        
         logger.info(f"📏 UV Mapping:")
         logger.info(f"   Design: {design_w}×{design_h}")
         logger.info(f"   UV Map: {w}×{h}")
         logger.info(f"   UV range: U[{U.min():.3f}, {U.max():.3f}] V[{V.min():.3f}, {V.max():.3f}]")
+        logger.info(f"   Aspect factor: {aspect_factor}")
         
         # Convertir UV [0,1] a coordenadas de pixel
-        map_x = U * (design_w - 1)
+        # aspect_factor comprime el muestreo horizontal para compensar el
+        # estiramiento por la relación U/V del UVMap (medido con test de cuadrado).
+        map_x = U * (design_w - 1) * aspect_factor
         map_y = V * (design_h - 1)
         
         # ============================================
