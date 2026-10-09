@@ -70,8 +70,9 @@ class SimpleCompositor:
 
         Args:
             beauty: Beauty pass con iluminación completa
-            design: Diseño del usuario
-            zones: Lista de dicts {'uv_map': (H,W,3) [0,1], 'mask': (H,W) 2D [0,1]}
+            design: Diseño del usuario (fallback o por zona si 'design' en z)
+            zones: Lista de dicts {'uv_map': (H,W,3) [0,1], 'mask': (H,W) 2D [0,1],
+                                   'design'?: (H,W,C) diseño propio de la zona}
             flip_vertical: Voltear el diseño verticalmente (coordenadas UV)
             aspect_factor: Corrección de proporción de aspecto
 
@@ -80,7 +81,6 @@ class SimpleCompositor:
         """
         logger.info(f"🎨 Compositor MULTIZONA - pasando por {len(zones)} zonas")
         h, w = beauty.shape[:2]
-        design_flipped = np.flipud(design) if flip_vertical else design
 
         smooth_masks = []
         prepared = []
@@ -94,7 +94,12 @@ class SimpleCompositor:
             if m.shape[:2] != (h, w):
                 m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
             smooth_masks.append(SimpleCompositor._smooth_mask(m, blur_size=9))
-            prepared.append({'uv_map': uv, 'mask': m})
+            prepared.append({
+                'uv_map': uv,
+                'mask': m,
+                'u_shift': z.get('u_shift', 0.0),
+                'design': z.get('design', design),
+            })
 
         union = np.maximum.reduce(smooth_masks)
         union_region = union > 0.5
@@ -115,7 +120,10 @@ class SimpleCompositor:
 
         design_lit = np.zeros_like(beauty, dtype=np.float32)
         for z, sm in zip(prepared, smooth_masks):
-            dm = SimpleCompositor._apply_design_simple(design_flipped, z['uv_map'], z['mask'], aspect_factor)
+            z_design = z['design']
+            z_design_flipped = np.flipud(z_design) if flip_vertical else z_design
+            dm = SimpleCompositor._apply_design_simple(z_design_flipped, z['uv_map'], z['mask'], aspect_factor,
+                                                       u_shift=z.get('u_shift', 0.0))
             design_lit += dm * lighting * sm[:, :, np.newaxis]
 
         result = beauty * (1.0 - union[:, :, np.newaxis]) + design_lit
@@ -273,7 +281,8 @@ class SimpleCompositor:
     @staticmethod
     def _apply_design_simple(design: np.ndarray, uv_map: np.ndarray, mask: np.ndarray,
                             aspect_factor: float = 1.0,
-                            region: dict | None = None) -> np.ndarray:
+                            region: dict | None = None,
+                            u_shift: float = 0.0) -> np.ndarray:
         """
         Mapea el diseño usando coordenadas UV CON EROSIÓN DE MÁSCARA
         
@@ -286,6 +295,9 @@ class SimpleCompositor:
             region: Bbox {'umin','umax','vmin','vmax'} de la superficie en el
                 atlas. Si se define, el diseño se muestrea NORMALIZADO a esa
                 región (el diseño completo llena la malla de la superficie).
+            u_shift: Desplaza el muestreo U para alinear el centro del diseño
+                (0.5) con el centro de la isla UV (gorra/chapa). Solo aplica en
+                modo máscara (sin región).
 
         Returns:
             Diseño mapeado al render
@@ -318,7 +330,10 @@ class SimpleCompositor:
         # Convertir UV [0,1] a coordenadas de pixel
         # aspect_factor comprime el muestreo horizontal para compensar el
         # estiramiento por la relación U/V del UVMap (medido con test de cuadrado).
-        map_x = U * (design_w - 1) * aspect_factor
+        # u_shift desplaza el muestreo U para centrar el diseño en la isla
+        # (gorra/chapa): map_x = (U + u_shift) * width.
+        u_off = u_shift if not region else 0.0
+        map_x = (U + u_off) * (design_w - 1) * aspect_factor
         map_y = V * (design_h - 1)
         
         # ============================================

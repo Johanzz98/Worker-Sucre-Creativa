@@ -13,6 +13,7 @@ import http.server
 import socketserver
 import threading
 import numpy as np
+import cv2
 from psycopg2.extras import RealDictCursor
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -227,7 +228,7 @@ class MockupWorker:
 
         return None
 
-    def get_zones_for_product(self, renders_path: Path) -> List[Dict]:
+    def get_zones_for_product(self, renders_path: Path, product: str = "") -> List[Dict]:
         """
         Detecta las zonas de impresión de un producto (multizona) escaneando
         el directorio de renders del ángulo.
@@ -236,12 +237,25 @@ class MockupWorker:
         esa zona en este ángulo) junto al UVMap unificado (UVMap.exr): ambos son
         el fragmento visible desde la cámara, así que el diseño se mapea con el
         mismo UVMap pero restringido a la máscara de cada zona.
+
+        EXCEPCIÓN (gorra/chapita): usa UN solo ID.png (igual que la polera),
+        con su único mesh de impresión (la banda) como zona.
         """
         zones = []
         uvmap = renders_path / "UVMap.exr"
         if not uvmap.exists():
             return zones
         try:
+            if self._is_mask_based(product):
+                id_file = renders_path / "ID.png"
+                if id_file.exists():
+                    zones.append({
+                        "key": "banda",
+                        "uvmap": str(uvmap),
+                        "mask": str(id_file),
+                    })
+                    logger.info(f"🧩 Zona única ID.png para {product}: [banda]")
+                return zones
             for mask_file in renders_path.glob("ID_*.png"):
                 key = mask_file.stem.replace("ID_", "", 1)
                 if not key or key == "unified":
@@ -267,14 +281,121 @@ class MockupWorker:
         "atras":  {"umin": 0.520, "umax": 0.980, "vmin": 0.270, "vmax": 0.730},
     }
 
+    # Productos cuya única superficie de impresión es ELLA MISMA y cuya isla UV
+    # NO respeta el atlas del plan A (mitades frente/atrás del polera). Se
+    # componen por MÁSCARA (multizona): el diseño se mapea directo por (U,V) del
+    # mesh imprimible (igual que el GLB del editor) y se restringe con la máscara
+    # del objeto (ID.png en la carpeta del ángulo).
+    # El matching es por SUBSTRING: el job llega con product=model_key
+    # (ej. "Cylinder.00111", "chapa", "chapita") que puede variar según el asset,
+    # pero la familia es la misma ("cylinder.001*"/"chapita*"/"chapa*").
+    MASK_BASED_PRODUCTS = {"chapita", "Cylinder.001", "chapa"}
+
+    @staticmethod
+    def _is_mask_based(product: str) -> bool:
+        p = (product or "").lower()
+        return 'chapita' in p or 'cylinder.001' in p or 'chapa' in p
+
+    def _product_folder(self, product: str) -> Path:
+        if product.startswith("taza_"):
+            return self.python_app_path / "data" / "blender-passes" / "taza" / product
+        return self.python_app_path / "data" / "blender-passes" / product
+
+    def _has_frontback_masters(self, product: str) -> bool:
+        """True si el producto tiene los dos masters de superficie (frente/atras),
+        es decir el modelo per-mesh del polera."""
+        folder = self._product_folder(product)
+        return (folder / "UVMap_frente.exr").exists() and (folder / "UVMap_atras.exr").exists()
+
+    def _frontback_zones(self, renders_path: Path, product: str) -> List[Dict]:
+        """
+        Zonas per-mesh del polera desde el ID unificado.
+
+        El ID.png trae, por píxel, la superficie VISIBLE / N (0 = no imprimible,
+        1/N = frente, 2/N = atras). Se recupera el índice (round(valor*N)) y se
+        deriva la máscara de cada superficie (mask_k = id == k). Cada zona usa el
+        UVMap del ángulo (UV de la superficie visible) -> composición per-mesh
+        igual que el editor. No necesita re-UV.
+        """
+        id_path = renders_path / "ID.png"
+        uv_path = renders_path / "UVMap.exr"
+        if not id_path.exists() or not uv_path.exists():
+            return []
+        keys = list(self.PLAN_A_REGIONS.keys())
+        n = len(keys)
+        try:
+            img = cv2.imread(str(id_path), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return []
+            if img.ndim == 3:
+                img = img[:, :, 0]
+            idx = np.rint(img.astype(np.float32) / 255.0 * n).astype(np.int32)
+            cache = self.python_app_path / "data" / "mask-cache" / product / renders_path.name
+            cache.mkdir(parents=True, exist_ok=True)
+            zones: List[Dict] = []
+            for i, key in enumerate(keys, start=1):
+                mask = (idx == i)
+                mask_png = cache / f"ID_{key}.png"
+                cv2.imwrite(str(mask_png), (mask.astype(np.uint8)) * 255)
+                logger.info(f"🎭 Zona '{key}' (id={i}) desde ID.png: {int(mask.sum())} px")
+                zones.append({"key": key, "uvmap": str(uv_path), "mask": str(mask_png)})
+            return zones
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo derivar zonas de {id_path}: {e}")
+            return []
+
+    @staticmethod
+    def _derive_zone_mask(master_path: Path, out_png: Path) -> Optional[Path]:
+        """
+        Deriva la MÁSCARA de una zona desde su master UV (UVMap_<key>.exr).
+
+        El master se renderiza con SOLO ese mesh visible desde la misma cámara
+        que el Beauty/ID del pack -> los píxeles con UV != 0 de ese master son
+        exactamente la silueta de esa zona en el frame del pack (la unión de
+        todas las zonas equivale al ID.png unificado).
+
+        Es la SEÑAL CORRECTA para el pack de chapitas: como todas comparten la
+        misma isla UV (mismo rango U/V), una región por bbox no discrimina, pero
+        la silueta por píxel sí (Cylinder01..05 están en posiciones distintas).
+        """
+        try:
+            uv = UVMapManager.load_uv_map_from_file(str(master_path), normalize=False)
+            if uv is None:
+                return None
+            u = uv[:, :, 0]
+            v = uv[:, :, 1]
+            mask = (np.abs(u) > 1e-4) | (np.abs(v) > 1e-4)
+            if not mask.any():
+                logger.warning(f"⚠️ Master sin silueta UV: {master_path}")
+                return None
+            img = (mask.astype(np.uint8)) * 255
+            # ID de zona en escala de grises (igual que ID.png de las otras zonas)
+            out_png.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out_png), img)
+            logger.info(f"🎭 Máscara de zona '{master_path.stem}' derivada: "
+                        f"{int(mask.sum())} px -> {out_png.name}")
+            return out_png
+        except Exception as e:
+            logger.error(f"❌ Error derivando máscara de {master_path}: {e}")
+            return None
+
     def get_surface_regions(self, product: str) -> List[Dict]:
         """
-        Detecta las superficies FRENTE/BACK de un producto a partir de sus
-        MASTERS UV (renders/<product>/UVMap_frente.exr, UVMap_atras.exr).
+        Detecta las superficies de un producto a partir de sus MASTERS UV
+        (renders/<product>/UVMap_<key>.exr).
 
-        Cada superficie se define por la región UV (bbox) que ocupa su isla en
-        el atlas (las mitades del plan A son disjuntas). El worker compone cada
-        diseño dentro de su región, sin necesidad de máscaras por zona.
+        - MULTIZONA por masters (pack de chapitas: UVMap_primera.exr ...):
+          la señal NO es la región UV (todas las chapitas comparten el mismo
+          rango U/V), sino la SILUETA por píxel del master (cada master se
+          renderiza con solo su mesh visible desde la misma cámara del pack).
+          Para cada zona se deriva su máscara ID_<key>.png y se devuelve el
+          modelo {uvmap, mask}, el mismo que usa get_zones_for_product
+          (composición MULTIZONA con u_shift de centrado). Producto-agnóstico:
+          decide por los masters presentes, no por el nombre. La chapita
+          individual (sin masters por zona) cae a la banda / máscara.
+        - FRENTE/BACK clásico (polera): regiones plan A por master frente/atras.
+        - Máscara (taza/gorra/chapita individual): sin masters por zona -> []
+          y el caller usa la rama banda (ID.png unificado).
         """
         if product.startswith("taza_"):
             product_folder = self.python_app_path / "data" / "blender-passes" / "taza" / product
@@ -283,6 +404,35 @@ class MockupWorker:
 
         if not product_folder.exists():
             logger.warning(f"⚠️ Carpeta de producto no existe para superficies: {product_folder}")
+            return []
+
+        # Masters por zona (excluye el UVMap unificado UVMap.exr).
+        masters_by_zone: Dict[str, Path] = {}
+        for master in sorted(product_folder.glob("UVMap_*.exr")):
+            key = master.stem[len("UVMap_"):]
+            if not key or key == "unified":
+                continue
+            masters_by_zone[key] = master
+
+        extra_keys = [k for k in masters_by_zone if k not in ("frente", "atras")]
+        if extra_keys:
+            zones = []
+            for key in extra_keys:
+                master = masters_by_zone[key]
+                mask_png = product_folder / f"ID_{key}.png"
+                if not mask_png.exists():
+                    derived = self._derive_zone_mask(master, mask_png)
+                    if derived is None:
+                        logger.warning(f"⚠️ No se pudo derivar máscara para zona '{key}'")
+                        continue
+                zones.append({"key": key, "uvmap": str(master), "mask": str(mask_png)})
+                logger.info(f"🧩 Zona '{key}' | UVMap: {master.name} | máscara: {mask_png.name}")
+            if zones:
+                logger.info(f"🧩 Pack '{product}': {len(zones)} zonas por master")
+                return zones
+
+        if self._is_mask_based(product):
+            logger.info(f"🧩 Producto {product}: composición por MÁSCARA (isla UV no plan A)")
             return []
 
         surfaces = []
@@ -575,10 +725,25 @@ class MockupWorker:
             return
 
         # Modo público (fallback): key determinista renders/<product>/UVMap_<key>.exr
+        # Claves conocidas: frente/atras (polera) + las que vengan en
+        # metadata.renders.masters (pack de chapitas: primera, segunda, ...).
         if not self.r2_enabled:
             return
         try:
-            for key in ("frente", "atras"):
+            keys = ["frente", "atras"]
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT metadata FROM assets_3d WHERE model_key = %s", (product,))
+            row = cursor.fetchone()
+            cursor.close()
+            meta = row[0] if row and row[0] else {}
+            rm = (meta or {}).get("renders", {}).get("masters") if isinstance(meta, dict) else None
+            if isinstance(rm, dict):
+                seen = set(keys)
+                for k in rm:
+                    if k and k not in seen:
+                        keys.append(k)
+                        seen.add(k)
+            for key in keys:
                 dest = product_folder / f"UVMap_{key}.exr"
                 if dest.exists():
                     continue
@@ -600,7 +765,7 @@ class MockupWorker:
             logger.warning(f"⚠️ No se pudo resolver product_type para {product}: {e}")
             return None
 
-    def _run_mockup_generator(self, product: str, angle: str, design_path: Path, output_dir: Path, output_filename: str, print_zone: Optional[Dict] = None, zones: Optional[List[Dict]] = None, design_back_path: Optional[Path] = None) -> bool:
+    def _run_mockup_generator(self, product: str, angle: str, design_path: Path, output_dir: Path, output_filename: str, print_zone: Optional[Dict] = None, zones: Optional[List[Dict]] = None, design_back_path: Optional[Path] = None, zone_designs: Optional[Dict[str, Path]] = None) -> bool:
         """Ejecutar el generador de mockups para un ángulo específico"""
         try:
             # Construir ruta dinámica para este producto y ángulo
@@ -665,8 +830,21 @@ class MockupWorker:
             # Pasar zonas (multizona o superficies FRENTE/BACK) si las hay
             if zones:
                 import json as _json
-                cmd.extend(["--zones", _json.dumps(zones)])
-                logger.info(f"   ✓ Zonas ({len(zones)}): {[z['key'] for z in zones]}")
+                # Pack multizona: cada zona lleva su propio diseño descargado
+                # (designs por zona: primera, segunda, ... quinta). El modelo
+                # heredado sin designs por zona sigue usando el diseño principal.
+                zones_for_job = []
+                for z in zones:
+                    zz = dict(z)
+                    z_key = z.get("key")
+                    z_design = (zone_designs or {}).get(z_key)
+                    if z_design and z_design.exists():
+                        zz["design"] = str(z_design.absolute())
+                    zones_for_job.append(zz)
+                cmd.extend(["--zones", _json.dumps(zones_for_job)])
+                logger.info(f"   ✓ Zonas ({len(zones_for_job)}): {[z['key'] for z in zones_for_job]}")
+                if zone_designs:
+                    logger.info(f"   ✓ {len(zone_designs)} diseños por zona: {list(zone_designs.keys())}")
 
             # Pasar print zone si el producto lo define en el job
             if print_zone:
@@ -809,6 +987,45 @@ class MockupWorker:
                     return False
 
             output_dir = self.python_app_path / "data" / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # --- Diseños por zona de impresión (pack: primera..quinta) ---
+            zone_designs: Dict[str, Path] = {}
+            zone_designs_data = job_data.get("zoneDesigns") or job_data.get("zone_designs")
+            if zone_designs_data:
+                dl_dir = self.python_app_path / "data" / "downloads"
+                dl_dir.mkdir(parents=True, exist_ok=True)
+                for zd in zone_designs_data:
+                    z_key = zd.get("key")
+                    z_design_key = zd.get("designKey") or zd.get("design_key")
+                    z_design_url = zd.get("designUrl") or zd.get("design_url")
+                    if not z_key or not (z_design_key or z_design_url):
+                        continue
+                    suffix = Path((z_design_key or "zone.png").replace('\\', '/')).suffix or ".png"
+                    z_path = dl_dir / f"design_{job_id}_{z_key}{suffix}"
+                    if z_design_url:
+                        src = z_design_url
+                    elif z_design_key.startswith(("http://", "https://")):
+                        src = z_design_key
+                    elif self.r2_enabled:
+                        src = f"{self.r2_config['public_url'].rstrip('/')}/{z_design_key}"
+                    else:
+                        src = self.base_storage_path / z_design_key
+                        if not Path(src).exists():
+                            logger.error(f"❌ Diseño de zona '{z_key}' no encontrado: {z_design_key}")
+                            self._update_job_status(job_id, "failed", f"Diseño de zona '{z_key}' no encontrado")
+                            return False
+                    logger.info(f"⬇️ Descargando diseño de zona '{z_key}': {str(src)[:120]}")
+                    if self._r2_download(str(src), z_path):
+                        zone_designs[z_key] = z_path
+                        logger.info(f"✅ Diseño de zona '{z_key}' descargado: {z_path.name}")
+                    else:
+                        error_msg = f"No se pudo descargar el diseño de zona '{z_key}'"
+                        logger.error(f"❌ {error_msg}")
+                        self._update_job_status(job_id, "failed", error_msg)
+                        return False
+                if zone_designs:
+                    logger.info(f"✅ Diseños por zona listos: {list(zone_designs.keys())}")
 
             # Sincronizar renders desde R2 (si el job trae URLs firmadas, esas mandan).
             # Si no baja nada, se mantiene el comportamiento actual: disco local.
@@ -846,24 +1063,28 @@ class MockupWorker:
             # Print zone del producto (opcional) para recortar el diseño a la superficie real
             print_zone = job_data.get("printZone") or job_data.get("metadata", {}).get("printZone")
 
-            # Zonas de composición. Modelo FRENTE/BACK (job con 2 diseños): las
-            # superficies se segmentan por la región UV de cada master
-            # (UVMap_frente/atras.exr) sin máscaras. Modelo heredado: multizona
-            # desde el primer ángulo con renders (UVMap_<key>.exr + ID_<key>.png).
+            # Zonas de composición.
+            # - PER-MESH (polera frente/atrás): las máscaras y el UVMap son POR
+            #   ÁNGULO (la superficie visible cambia de una toma a otra), así que
+            #   se calculan dentro del loop de ángulos.
+            # - Región UV (PLAN_A) / multizona por masters: no dependen del
+            #   ángulo; se calculan una vez y se reusan.
             design_back_active = design_back_key is not None or design_back_url is not None
+            frontback = self._has_frontback_masters(product)
             zones = []
-            surface_masters = self.get_surface_regions(product)
-            if surface_masters:
-                zones = surface_masters
-                logger.info(f"👇 Producto {product}: {len(zones)} superficies (FRENTE/BACK por región UV)")
-            else:
-                for angle in angles:
-                    probes = self.get_render_path(product, angle)
-                    zones = self.get_zones_for_product(probes)
+            if not frontback:
+                surface_masters = self.get_surface_regions(product)
+                if surface_masters:
+                    zones = surface_masters
+                    logger.info(f"👇 Producto {product}: {len(zones)} superficies (FRENTE/BACK por región UV)")
+                else:
+                    for angle in angles:
+                        probes = self.get_render_path(product, angle)
+                        zones = self.get_zones_for_product(probes, product)
+                        if zones:
+                            break
                     if zones:
-                        break
-                if zones:
-                    logger.info(f"👇 Producto {product}: {len(zones)} zonas de impresión")
+                        logger.info(f"👇 Producto {product}: {len(zones)} zonas de impresión")
 
             # Modo BLENDER (render por partes): re-renderiza los ángulos con el
             # diseño horneado como textura -> idéntico al preview GLB. Si no se
@@ -882,6 +1103,17 @@ class MockupWorker:
 
                     output_filename = f"mockup_{job_id}_{product}_{angle}.png"
 
+                    # Per-mesh: zonas del ángulo actual (máscaras + UVMap propios).
+                    angle_zones = zones
+                    if frontback:
+                        probes = self.get_render_path(product, angle)
+                        angle_zones = self._frontback_zones(probes, product)
+                        if angle_zones:
+                            logger.info(f"🧩 {angle}: {len(angle_zones)} zonas per-mesh")
+                        else:
+                            angle_zones = self.get_surface_regions(product)
+                            logger.warning(f"⚠️ {angle}: sin zonas per-mesh; fallback por región")
+
                     if render_by_angle and angle in render_by_angle:
                         # Re-render con diseño horneado (textura real, misma que el GLB)
                         mockup_file = output_dir / output_filename
@@ -890,7 +1122,7 @@ class MockupWorker:
                         if success:
                             logger.info(f"✅ [{index}/{len(angles)}] Mockup (Blender): {angle}")
                     else:
-                        success = self._run_mockup_generator(product, angle, design_path, output_dir, output_filename, print_zone=print_zone, zones=zones, design_back_path=design_back_path)
+                        success = self._run_mockup_generator(product, angle, design_path, output_dir, output_filename, print_zone=print_zone, zones=angle_zones, design_back_path=design_back_path, zone_designs=zone_designs)
                     
                     if success:
                         mockup_file = output_dir / output_filename

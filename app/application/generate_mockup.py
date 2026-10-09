@@ -120,6 +120,12 @@ def generate_mockup(
             or 'mug' in product_type_lower
             or 'polera' in product_type_lower
             or 'tshirt' in product_type_lower
+            # Chapita / Chapa / Cylinder.001: máscara ID.png + flip vertical.
+            # Es la única corrección para la gorra (sale volteada de abajo
+            # hacia arriba).
+            or 'chapita' in product_lower
+            or 'chapa' in product_lower
+            or 'cylinder.001' in product_lower
         )
         logger.info(f"🔄 Flip vertical del diseño: {flip_vertical} (producto: {product_id}, tipo: {product_type or 'no informado'})")
 
@@ -137,29 +143,18 @@ def generate_mockup(
             surface_mode = any('region' in (z or {}) for z in zones)
             if surface_mode:
                     logger.info(f"🧩 Composición SUPERFICIES (FRENTE/BACK) con {len(zones)} zonas por región UV")
-                    # Vista por ángulo: desde el FRENTE no se ve la espalda y desde
-                    # el ATRÁS no se ve el pecho (salvo caras interiores que NO deben
-                    # imprimirse). Pintamos 'frente' en los ángulos donde la cámara
-                    # apunta al frente (centro/derecha/izquierda) y 'atras' donde
-                    # apunta a la espalda (atras/derecha/izquierda). Sin esto, el
-                    # compositor pinta las caras interiores visibles por el dobladillo/
-                    # cuello y el mockup del atrás mezcla ambos diseños.
+                    # Cada superficie se pinta por su REGIÓN UV (máscara por oclusión
+                    # real, ver _mask_from_region), no por el nombre de la carpeta del
+                    # ángulo. Antes se apagaba 'atras' cuando el ángulo se llamaba
+                    # 'centro', lo que borraba la espalda en cualquier ángulo que no
+                    # se llamara exactamente 'derecha'/'izquierda' (p.ej. todos los
+                    # 'centro' inclinados). La región UV ya decide qué se ve.
                     angle_name = Path(render_passes_dir or "").name.lower()
-                    known_angle = angle_name in ("centro", "atras", "derecha", "izquierda")
-
-                    def zone_active(key: str):
-                        if not known_angle:
-                            return True
-                        if key == "atras":
-                            return angle_name in ("atras", "derecha", "izquierda")
-                        return angle_name in ("centro", "derecha", "izquierda")
+                    logger.info(f"📐 Ángulo '{angle_name}': se componen todas las superficies por región UV")
 
                     zone_configs = []
                     for z in zones:
                         key = z.get("key", "?")
-                        if not zone_active(key):
-                            logger.info(f"🚫 Zona '{key}' inactiva para ángulo '{angle_name}' (vista opuesta)")
-                            continue
                         region = z.get("region")
                         if not region:
                             raise ValueError(f"Zona '{key}': falta 'region' en modo superficies")
@@ -234,15 +229,51 @@ def generate_mockup(
                         z_mask_img = np.mean(z_mask_img, axis=2)
                     z_mask = (z_mask_img > 0.1).astype(np.float32)
 
+                    # Diseño propio de la zona (pack: cada chapita su diseño). Si
+                    # no viene, la zona usa el diseño principal (modelo heredado).
+                    z_design = design
+                    z_design_path = z.get("design")
+                    if z_design_path:
+                        if not Path(z_design_path).is_absolute():
+                            z_design_path = str(Path(render_passes_dir) / z_design_path)
+                        z_design = SimplePassLoader._load_image(Path(z_design_path))
+                        logger.info(f"🎨 Zona '{key}': diseño propio {z_design.shape[1]}x{z_design.shape[0]}")
+
+                    # Polera per-mesh: la superficie 'atras' usa el diseño trasero
+                    # (design_back). Sin design_back, la espalda queda blanca.
+                    if not z_design_path and key == 'atras' and design_back is not None:
+                        z_design = design_back
+                        logger.info("🎨 Zona 'atras': usando diseño trasero (design_back)")
+
                     z_aspect = float(z.get("aspect_factor", aspect_factor))
                     logger.info(f"🗺️  Zona '{key}' | UVMap: {z_uv_path}")
                     logger.info(f"   Máscara: {z_id_path} | píxeles: {np.sum(z_mask > 0)}")
                     logger.info(f"   Aspect factor: {z_aspect}")
 
+                    # Gorra (chapa/chapita/Cylinder.001): centrar el diseño igual
+                    # que el preview GLB. Se alinea el centro del canvas (0.5)
+                    # con el centro de la isla UV visible, con centro robusto por
+                    # percentiles (1-99) para no dejarse contaminar por el
+                    # antialiasing del contorno del ID. Sin esto, el render cae
+                    # más a la izquierda que el GLB.
+                    u_shift = 0.0
+                    if ('chapita' in product_lower or 'chapa' in product_lower
+                            or 'cylinder.001' in product_lower):
+                        um = z_uv[:, :, 0][z_mask > 0.5]
+                        if um.size:
+                            p1, p99 = np.percentile(um, [1.0, 99.0])
+                            u_shift = 0.5 - (p1 + p99) / 2.0
+                            logger.info(
+                                f"↔️ U-shift de centrado (gorra): {u_shift:+.4f} "
+                                f"(isla U robusta [{p1:.4f},{p99:.4f}])"
+                            )
+
                     zone_configs.append({
                         "uv_map": z_uv,
                         "mask": z_mask,
+                        "design": z_design,
                         "aspect_factor": z_aspect,
+                        "u_shift": u_shift,
                     })
 
                 final_result = SimpleCompositor.create_mockup_multi(
@@ -250,8 +281,17 @@ def generate_mockup(
                     flip_vertical=flip_vertical,
                 )
         else:
+            # Una sola superficie (taza/gorra): el diseño se mapea con la UV
+            # ABSOLUTA del render (igual que el editor 3D), NO normalizada.
+            # Normalizar al rango visible estira el diseño cuando la superficie
+            # no se ve entera (p.ej. la taza envuelve: UV visible 0..0.745).
+            uv_abs = (
+                UVMapManager.load_uv_map_from_file(uvmap_path, normalize=False)
+                if uvmap_path
+                else UVMapManager.load_uv_map(render_passes_dir, normalize=False)
+            )
             final_result = SimpleCompositor.create_mockup(
-                beauty, design, uv_map, mask,
+                beauty, design, uv_abs if uv_abs is not None else uv_map, mask,
                 flip_vertical=flip_vertical,
                 aspect_factor=aspect_factor
             )
