@@ -6,7 +6,10 @@ class RedisService:
     def __init__(self):
         self.client = redis.Redis.from_url(
             settings.REDIS_URL,
-            decode_responses=True  # convierte bytes a string
+            decode_responses=True,  # convierte bytes a string
+            socket_connect_timeout=10,
+            socket_timeout=40,
+            socket_keepalive=True,
         )
 
     def ping(self):
@@ -22,7 +25,7 @@ class RedisService:
         """Agrega un job a la cola mockup:jobs"""
         self.client.lpush("mockup:jobs", json.dumps(job))
 
-    def pop_job(self, timeout=5):
+    def pop_job(self, timeout=30):
         """Espera bloqueando hasta que llegue un job (BRPOP)"""
         result = self.client.brpop("mockup:jobs", timeout=timeout)
         if result:

@@ -1,8 +1,53 @@
-numpy
-Pillow
-opencv-python
-redis
-python-dotenv
-psycopg2-binary
-boto3
-OpenEXR
+# ============================================================
+# Dependencias del worker de mockups (renderpy)
+# ============================================================
+#
+# Entorno verificado:
+#   Python 3.12.x  (probado con Python 3.12.7 en Windows)
+#
+# Instalacion (PowerShell):
+#   python -m venv .venv
+#   .\.venv\Scripts\activate
+#   pip install -r requirements.txt
+#
+# ------------------------------------------------------------
+# ¿POR QUE LAS VERSIONES ESTAN FIJAS?
+# ------------------------------------------------------------
+# El worker consume la cola con BRPOP (comando BLOQUEANTE) sobre
+# Redis / Upstash. A partir de redis-py 8.0 cambio el valor por
+# defecto de socket_timeout:
+#
+#     redis/_defaults.py  ->  DEFAULT_SOCKET_TIMEOUT = 5   (5s)
+#
+# Antes (redis-py 4.x/5.x) ese valor era None = esperar sin limite.
+# Con redis 8, un BRPOP con timeout=30 hace que el socket del
+# cliente se rinda a los 5s aunque el servidor siga esperando los
+# 30s, provocando el error en bucle:
+#
+#     redis.exceptions.TimeoutError: Timeout reading from socket
+#
+# El codigo ya fuerza socket_timeout=40 (> 30s del BRPOP), pero
+# dejamos la version FIJADA para que la laptop y la PC usen
+# exactamente lo mismo y no vuelva a romperse por una instalacion
+# nueva de "redis" sin version.
+#
+# TODO: si actualizas alguna libreria, actualiza tambien esta
+# linea y vuelve a probar el worker antes de moverlo de maquina.
+# ============================================================
+
+# --- Core del worker ---
+numpy==2.5.4                # operaciones de imagen / mascaras UV
+Pillow==12.3.0              # carga/guardado de PNG de renders y disenos
+opencv-python==5.0.0.93     # composicion y procesado de imagenes
+OpenEXR==3.5.2              # lectura de UVMap.exr (mapas UV de Blender)
+
+# --- Cola de trabajos (Redis / Upstash) ---
+# OJO: ver explicacion de socket_timeout mas arriba. No actualizar a ciegas.
+redis==8.1.0
+
+# --- Configuracion y base de datos ---
+python-dotenv==1.2.4        # carga del archivo .env
+psycopg2-binary==2.9.13     # conexion a PostgreSQL (Neon)
+
+# --- Almacenamiento de mockups (Cloudflare R2 / S3) ---
+boto3==1.43.114             # subida de mockups a R2 (opcional)

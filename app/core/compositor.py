@@ -42,7 +42,9 @@ class SimpleCompositor:
         h, w = beauty.shape[:2]
         if uv_map.shape[:2] != (h, w):
             logger.info(f"🔧 Redimensionando UV Map de {uv_map.shape[1]}x{uv_map.shape[0]} a {w}x{h}")
-            uv_map = cv2.resize(uv_map, (w, h), interpolation=cv2.INTER_LINEAR)
+            # NEAREST: promediar UV de islas distintas en las costuras apunta al
+            # medio de la textura y mete color equivocado en el diseño.
+            uv_map = cv2.resize(uv_map, (w, h), interpolation=cv2.INTER_NEAREST)
         
         # 1. Voltear diseño verticalmente (coordinadas UV) según el producto
         design_flipped = np.flipud(design) if flip_vertical else design
@@ -90,9 +92,9 @@ class SimpleCompositor:
                 m = np.mean(m, axis=2)
             uv = z['uv_map']
             if uv.shape[:2] != (h, w):
-                uv = cv2.resize(uv, (w, h), interpolation=cv2.INTER_LINEAR)
+                uv = cv2.resize(uv, (w, h), interpolation=cv2.INTER_NEAREST)
             if m.shape[:2] != (h, w):
-                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
             smooth_masks.append(SimpleCompositor._smooth_mask(m, blur_size=9))
             prepared.append({
                 'uv_map': uv,
@@ -116,7 +118,9 @@ class SimpleCompositor:
             white_base = np.array([0.9, 0.9, 0.9])
             logger.warning("⚠️ Sin región UV multizona, usando blanco estándar")
 
-        lighting = np.clip(beauty / np.maximum(white_base, 0.01)[np.newaxis, np.newaxis, :], 0.2, 1.8)
+        # Tope 1.0: antes llegaba a 1.8 y saturaba a blanco puro los blancos
+        # del diseño (otra fuente de "cosas blancas").
+        lighting = np.clip(beauty / np.maximum(white_base, 0.01)[np.newaxis, np.newaxis, :], 0.2, 1.0)
 
         design_lit = np.zeros_like(beauty, dtype=np.float32)
         for z, sm in zip(prepared, smooth_masks):
@@ -161,10 +165,10 @@ class SimpleCompositor:
             region = z['region']
             m = SimpleCompositor._mask_from_region(z['uv_map'], region)
             if m.shape[:2] != (h, w):
-                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
             uv = z['uv_map']
             if uv.shape[:2] != (h, w):
-                uv = cv2.resize(uv, (w, h), interpolation=cv2.INTER_LINEAR)
+                uv = cv2.resize(uv, (w, h), interpolation=cv2.INTER_NEAREST)
             smooth_masks.append(SimpleCompositor._smooth_mask(m, blur_size=9))
             prepared.append({'design': z['design'], 'uv_map': uv, 'mask': m,
                              'region': z['region'], 'aspect_factor': z.get('aspect_factor', 1.0)})
@@ -184,7 +188,9 @@ class SimpleCompositor:
             white_base = np.array([0.9, 0.9, 0.9])
             logger.warning("⚠️ Sin región UV, usando blanco estándar")
 
-        lighting = np.clip(beauty / np.maximum(white_base, 0.01)[np.newaxis, np.newaxis, :], 0.2, 1.8)
+        # Tope 1.0: antes llegaba a 1.8 y saturaba a blanco puro los blancos
+        # del diseño (otra fuente de "cosas blancas").
+        lighting = np.clip(beauty / np.maximum(white_base, 0.01)[np.newaxis, np.newaxis, :], 0.2, 1.0)
 
         design_lit = np.zeros_like(beauty, dtype=np.float32)
         for z, sm in zip(prepared, smooth_masks):
@@ -219,11 +225,35 @@ class SimpleCompositor:
         return m.astype(np.float32)
 
     @staticmethod
+    def _clean_mask(mask: np.ndarray) -> np.ndarray:
+        """Máscara lista para componer.
+
+        El ID.png que sale de Blender trae agujeros de 1-4 px (ruido). Antes se
+        rellenaban de BLANCO PURO y se veían como motas blancas en el mockup
+        (482 motas a 2048, 545 con contraste >60/255). Aquí se cierran esos
+        agujeros antes de usar la máscara.
+
+        NO se erosiona: la erosión de 2 px dejaba ver la pieza SIN IMPRIMIR
+        (blanca) en los primeros píxeles del contorno, y eso era la
+        "iluminación blanca rara" del borde. Medido sobre el puzzle: el borde
+        quedaba +45 niveles más claro que el interior; sin erosión baja a +5
+        (indistinguible) y el diseño solo se sale ~1 px de la silueta.
+        """
+        m = mask if mask.ndim == 2 else np.mean(mask, axis=2)
+        u8 = (np.clip(m, 0.0, 1.0) * 255).astype(np.uint8)
+        # Cerrar agujeros: recupera los píxeles de dentro que el ID dejó a 0.
+        u8 = cv2.morphologyEx(u8, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        # Suavizado mínimo (1 px): solo para antialias del contorno.
+        return cv2.GaussianBlur(u8.astype(np.float32) / 255.0, (3, 3), 0)
+
+    @staticmethod
     def _smooth_mask(mask: np.ndarray, erode_iterations: int = 2, blur_size: int = 9) -> np.ndarray:
         """Máscara erosionada y suavizada (reutilizada por blend y multizona)"""
         g = mask if mask.ndim == 2 else np.mean(mask, axis=2)
         kernel = np.ones((3, 3), np.uint8)
-        er = cv2.erode((g * 255).astype(np.uint8), kernel, iterations=erode_iterations)
+        g = cv2.morphologyEx((np.clip(g, 0.0, 1.0) * 255).astype(np.uint8),
+                             cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        er = cv2.erode(g, kernel, iterations=erode_iterations)
         er = er.astype(np.float32) / 255.0
         return cv2.GaussianBlur(er, (blur_size, blur_size), 0)
 
@@ -352,31 +382,14 @@ class SimpleCompositor:
         remapped_float = remapped.astype(np.float32) / 255.0
         
         # ============================================
-        # 🔧 FIX 2: EROSIONAR MÁSCARA PARA ELIMINAR BORDES PROBLEMÁTICOS
+        # 🔧 FIX 2: MÁSCARA LIMPIA (sin agujeros) Y SIN RELLENO BLANCO
+        # El ID trae agujeros de 1-4 px; rellenarlos de blanco puro producía
+        # las motas blancas visibles. Fuera de la máscara se devuelve el
+        # diseño tal cual: el blend ya pondera con la máscara.
         # ============================================
-        mask_gray = mask if len(mask.shape) == 2 else np.mean(mask, axis=2)
-        
-        # Erosionar la máscara 2-3 píxeles para eliminar bordes con artefactos
-        kernel_erode = np.ones((3, 3), np.uint8)
-        mask_eroded = cv2.erode((mask_gray * 255).astype(np.uint8), kernel_erode, iterations=2)
-        mask_eroded = mask_eroded.astype(np.float32) / 255.0
-        
-        # Suavizar la máscara erosionada
-        kernel_blur = 5
-        mask_smooth = cv2.GaussianBlur(mask_eroded, (kernel_blur, kernel_blur), 0)
-        
-        # ============================================
-        # 🔧 FIX 3: APLICAR MÁSCARA EROSIONADA AL DISEÑO
-        # ============================================
-        mask_3d = np.stack([mask_smooth] * 3, axis=-1)
-        
-        # Donde mask_smooth = 0 (bordes), usar blanco puro
-        white_background = np.ones_like(remapped_float)
-        design_masked = remapped_float * mask_3d + white_background * (1.0 - mask_3d)
-        
-        logger.info(f"✅ Diseño mapeado con erosión de máscara (kernel: {kernel_erode.shape[0]}×{kernel_erode.shape[1]})")
-        
-        return design_masked
+        logger.info("✅ Diseño mapeado (máscara limpia, sin relleno blanco)")
+
+        return remapped_float
     
     @staticmethod
     def _blend_with_lighting(beauty: np.ndarray, design: np.ndarray, 
@@ -407,18 +420,13 @@ class SimpleCompositor:
         else:
             mask_3d = mask
         
-        # Erosionar máscara para blend
+        # Máscara LIMPIA: cierra los agujeros de 1-4 px del ID (que antes
+        # salían como motas blancas) y suaviza el borde para el blend.
         mask_gray = mask_3d[:, :, 0]
-        kernel_erode = np.ones((3, 3), np.uint8)
-        mask_eroded = cv2.erode((mask_gray * 255).astype(np.uint8), kernel_erode, iterations=2)
-        mask_eroded = mask_eroded.astype(np.float32) / 255.0
-        
-        # Suavizar bordes para transiciones naturales
-        kernel_size = 9  # Aumentar blur para transición más suave
-        mask_smooth = cv2.GaussianBlur(mask_eroded, (kernel_size, kernel_size), 0)
+        mask_smooth = SimpleCompositor._clean_mask(mask_gray)
         mask_3d_smooth = np.stack([mask_smooth] * 3, axis=-1)
-        
-        logger.info(f"🎭 Máscara erosionada y suavizada - kernel blur: {kernel_size}×{kernel_size}")
+
+        logger.info("🎭 Máscara limpiada (agujeros cerrados, sin erosión)")
         
         # ═══════════════════════════════════════════════════════════════
         # 2. DETECTAR COLOR BASE BLANCO (AUTOMÁTICO)
@@ -446,8 +454,8 @@ class SimpleCompositor:
         white_base_safe = np.maximum(white_base, 0.01)
         lighting_factor = beauty / white_base_safe[np.newaxis, np.newaxis, :]
         
-        # Limitar rango
-        lighting_factor = np.clip(lighting_factor, 0.2, 1.8)
+        # Limitar rango (tope 1.0: no saturar a blanco puro los blancos del diseño)
+        lighting_factor = np.clip(lighting_factor, 0.2, 1.0)
         
         logger.info(f"💡 Factor de iluminación extraído:")
         logger.info(f"   Min: {lighting_factor.min():.3f} (sombras)")

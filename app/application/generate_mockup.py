@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import os
 from pathlib import Path
 import logging
 from typing import Dict, List, Optional
@@ -12,6 +13,21 @@ from app.core.compositor import SimpleCompositor
 logger = logging.getLogger(__name__)
 
 
+def _fit_size(img: np.ndarray, target_hw: tuple, interpolation: int = cv2.INTER_AREA) -> np.ndarray:
+    """Reescala solo si hace falta. Nunca aumenta.
+
+    Para los UVMap se pasa INTER_NEAREST: el mapa UV de estos renders tiene una
+    isla por pieza y en las costuras el UV salta 0,17-0,26. Con INTER_AREA/LINEAR
+    el reescalado promedia las coordenadas de dos islas distintas y apunta al
+    MEDIO de la textura, lo que metía amarillo dentro del azul (motas de 1-9 px
+    en las costuras). Con NEAREST cada píxel toma el UV de una sola isla.
+    """
+    th, tw = target_hw
+    if img is None or img.shape[:2] == (th, tw):
+        return img
+    return cv2.resize(img, (tw, th), interpolation=interpolation)
+
+
 def generate_mockup(
     product_id: str, 
     design_path: str, 
@@ -22,7 +38,9 @@ def generate_mockup(
     print_zone: Optional[Dict] = None,   # ← NUEVO PARÁMETRO: zona de impresión del producto
     product_type: Optional[str] = None,   # ← Tipo de producto (assets_3d.product_type)
     zones: Optional[List[Dict]] = None,    # ← NUEVO PARÁMETRO: zonas de impresión (frente/atras)
-    design_back_path: Optional[str] = None  # ← NUEVO PARÁMETRO: diseño superficie ATRÁS
+    design_back_path: Optional[str] = None,  # ← NUEVO PARÁMETRO: diseño superficie ATRÁS
+    output_size: Optional[int] = None,       # ← override de MOCKUP_OUTPUT_SIZE
+    jpeg_quality: Optional[int] = None,      # ← override de MOCKUP_JPEG_QUALITY
 ) -> Dict[str, str]:
     """
     Genera mockup usando compositor simple con flip vertical
@@ -50,6 +68,19 @@ def generate_mockup(
     """
     try:
         logger.info(f"🚀 GENERACIÓN SIMPLE: {product_id}")
+
+        # Resolución/calidad de salida. `output_size`/`jpeg_quality` permiten
+        # que el worker use valores distintos por ángulo: la vista principal
+        # (la del carrito) va a máxima calidad y los ángulos extra de la
+        # galería a menor tamaño/calidad, que suben mucho más rápido a R2.
+        out_size = (
+            int(output_size) if output_size is not None
+            else int(os.getenv("MOCKUP_OUTPUT_SIZE", "0") or 0)
+        )
+        jpeg_quality = (
+            int(jpeg_quality) if jpeg_quality is not None
+            else int(os.getenv("MOCKUP_JPEG_QUALITY", "97") or 97)
+        )
         
         # 1. Cargar diseño
         design = SimplePassLoader._load_image(Path(design_path))
@@ -102,31 +133,40 @@ def generate_mockup(
             mask = (mask > 0.1).astype(np.float32)
         
         logger.info(f"🎭 Máscara: {np.sum(mask > 0)} píxeles")
-        
+
+        # Resolución de trabajo/salida (MOCKUP_OUTPUT_SIZE).
+        # Se reescalan las ENTRADAS antes de componer: el remap y el blend
+        # trabajan a 1024 en vez de 2048 (4x menos píxeles). Nunca aumenta.
+        downscaled = False
+        if out_size and max(h, w) > out_size:
+            orig_w, orig_h = w, h
+            scale = out_size / float(max(h, w))
+            nw = max(1, int(round(w * scale)))
+            nh = max(1, int(round(h * scale)))
+            beauty = cv2.resize(beauty, (nw, nh), interpolation=cv2.INTER_AREA)
+            # La máscara es BINARIA (0/1): con INTER_AREA el promedio de los 4
+            # píxeles del borde inventa valores intermedios (hasta 14.825 px a
+            # 1024). Esos píxeles mezclan el fondo oscuro del render con el
+            # diseño y producen el halo oscuro/ámbar en el contorno. Con
+            # INTER_NEAREST el 0/1 se conserva y el borde lo suaviza después
+            # _clean_mask (que ya aplica blur).
+            mask = cv2.resize(mask, (nw, nh), interpolation=cv2.INTER_NEAREST)
+            # NEAREST también en el UV: promediar coordenadas de dos islas
+            # distintas en las costuras apunta al medio de la textura.
+            uv_map = _fit_size(uv_map, (nh, nw), interpolation=cv2.INTER_NEAREST)
+            h, w = nh, nw
+            downscaled = True
+            logger.info(f"📉 Resolución de salida: {nw}x{nh} (render original {orig_w}x{orig_h})")
+
         # 5. Composición
-        # El flip vertical se necesita cuando el UVMap viene con el eje V en
-        # orientación de imagen (es el caso de tazas/mug y de los UVMaps
-        # regenerados desde la pieza de impresión en poleras: Polerablancadefault,
-        # poleraNormali, y cualquier variante de color/camisa cuyo tipo sea polera).
-        # Se decide por el product_type del asset (el modelKey puede ser arbitrario:
-        # ej. "xxxxxxxxxxxxxxxxxxxxx"), con fallback al propio modelKey.
-        product_lower = (product_id or '').lower()
-        product_type_lower = (product_type or '')
-        flip_vertical = (
-            'taza' in product_lower
-            or 'mug' in product_lower
-            or 'polera' in product_lower
-            or 'taza' in product_type_lower
-            or 'mug' in product_type_lower
-            or 'polera' in product_type_lower
-            or 'tshirt' in product_type_lower
-            # Chapita / Chapa / Cylinder.001: máscara ID.png + flip vertical.
-            # Es la única corrección para la gorra (sale volteada de abajo
-            # hacia arriba).
-            or 'chapita' in product_lower
-            or 'chapa' in product_lower
-            or 'cylinder.001' in product_lower
-        )
+        # El flip vertical se aplica a TODOS los productos: los UVMap salen con
+        # el eje V invertido respecto a la imagen del editor. En Blender se ve
+        # bien porque allí el diseño se proyecta con la textura ya orientada,
+        # pero el worker compone con las coordenadas UV del render, así que sin
+        # el flip el diseño sale de cabeza. Antes esto era una lista de nombres
+        # (taza/mug/polera/chapita...) y por eso había que voltear a mano los
+        # productos que no estaban en la lista.
+        flip_vertical = True
         logger.info(f"🔄 Flip vertical del diseño: {flip_vertical} (producto: {product_id}, tipo: {product_type or 'no informado'})")
 
         # Corrección de proporción de aspecto: compensa el estiramiento/desplazamiento
@@ -290,12 +330,15 @@ def generate_mockup(
                 if uvmap_path
                 else UVMapManager.load_uv_map(render_passes_dir, normalize=False)
             )
+            # El UV ya está a resolución nativa: no hay que reescalarlo.
+            uv_abs = _fit_size(uv_abs, (h, w), interpolation=cv2.INTER_NEAREST)
             final_result = SimpleCompositor.create_mockup(
                 beauty, design, uv_abs if uv_abs is not None else uv_map, mask,
                 flip_vertical=flip_vertical,
                 aspect_factor=aspect_factor
             )
-        
+
+
         # 6. Guardar resultado con nombre personalizado o por defecto
         if output_name:
             output_path = Path(output_dir) / output_name
@@ -306,9 +349,16 @@ def generate_mockup(
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        final_uint8 = (final_result * 255).astype(np.uint8)
+        final_uint8 = np.clip(final_result * 255.0, 0, 255).astype(np.uint8)
         final_bgr = cv2.cvtColor(final_uint8, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(str(output_path), final_bgr)
+
+        if output_path.suffix.lower() in (".jpg", ".jpeg"):
+            ok = cv2.imwrite(str(output_path), final_bgr,
+                             [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+        else:
+            ok = cv2.imwrite(str(output_path), final_bgr)
+        if not ok:
+            raise RuntimeError(f"No se pudo escribir el mockup: {output_path}")
         
         logger.info(f"✅ ÉXITO: {output_path}")
         

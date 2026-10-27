@@ -1,10 +1,36 @@
 import cv2
 import numpy as np
 from pathlib import Path
+from functools import lru_cache
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Caché en memoria de los passes ya decodificados. El worker genera 4-5 ángulos
+# por job y los mismos Beauty/ID se leen una y otra vez; con esto se paga la
+# decodificación una sola vez. La clave incluye mtime+tamaño, así que si el
+# archivo se reemplaza (re-render desde el dashboard) se recarga solo.
+_CACHE_MAX = 40
+
+
+@lru_cache(maxsize=_CACHE_MAX)
+def _load_image_cached(path_str: str, mtime_ns: int, size: int) -> np.ndarray:
+    img = cv2.imread(path_str, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"No se pudo cargar imagen: {path_str}")
+
+    # Convertir BGR a RGB si es color
+    if len(img.shape) == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # Normalizar según tipo de dato
+    if img.dtype == np.uint16:
+        img = img.astype(np.float32) / 65535.0
+    else:
+        img = img.astype(np.float32) / 255.0
+
+    return img
 
 
 class SimplePassLoader:
@@ -41,27 +67,14 @@ class SimplePassLoader:
     @staticmethod
     def _load_image(file_path: Path) -> np.ndarray:
         """
-        Carga imagen y normaliza a [0,1] float32
-        
+        Carga imagen y normaliza a [0,1] float32 (con caché por ruta+mtime).
+
         Args:
             file_path: Ruta al archivo de imagen
-            
+
         Returns:
             Array numpy normalizado [0,1]
         """
-        img = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
-        
-        if img is None:
-            raise ValueError(f"No se pudo cargar imagen: {file_path}")
-        
-        # Convertir BGR a RGB si es color
-        if len(img.shape) == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Normalizar según tipo de dato
-        if img.dtype == np.uint16:
-            img = img.astype(np.float32) / 65535.0
-        else:
-            img = img.astype(np.float32) / 255.0
-        
-        return img
+        p = Path(file_path)
+        st = p.stat()
+        return _load_image_cached(str(p.resolve()), st.st_mtime_ns, st.st_size)
