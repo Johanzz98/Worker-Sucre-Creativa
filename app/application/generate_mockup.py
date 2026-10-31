@@ -67,6 +67,7 @@ def generate_mockup(
         Dict con status, product, output_file, resolution o error
     """
     try:
+        product_lower = str(product_id).lower()
         logger.info(f"🚀 GENERACIÓN SIMPLE: {product_id}")
 
         # Resolución/calidad de salida. `output_size`/`jpeg_quality` permiten
