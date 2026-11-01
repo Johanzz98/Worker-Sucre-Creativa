@@ -15,7 +15,8 @@ class SimpleCompositor:
     def create_mockup(beauty: np.ndarray, design: np.ndarray, 
                      uv_map: np.ndarray, mask: np.ndarray,
                      flip_vertical: bool = True,
-                     aspect_factor: float = 1.0) -> np.ndarray:
+                     aspect_factor: float = 1.0,
+                     alpha: np.ndarray = None) -> np.ndarray:
         """
         Genera mockup extrayendo iluminación del beauty pass
         
@@ -52,8 +53,19 @@ class SimpleCompositor:
         # 2. Aplicar diseño a través del UV map (CON FIX DE BORDES)
         design_applied = SimpleCompositor._apply_design_simple(design_flipped, uv_map, mask, aspect_factor)
         
-        # 3. Extraer iluminación del beauty y aplicarla al diseño
-        result = SimpleCompositor._blend_with_lighting(beauty, design_applied, mask)
+        # 3. La transparencia del PNG no debe pintar el fondo del producto.
+        effective_mask = mask
+        if alpha is not None:
+            alpha_flipped = np.flipud(alpha) if flip_vertical else alpha
+            am = SimpleCompositor._apply_design_simple(
+                alpha_flipped[:, :, np.newaxis], uv_map, mask, aspect_factor
+            )
+            if am.ndim == 3:
+                am = am[:, :, 0]
+            effective_mask = mask * np.clip(am, 0.0, 1.0)
+
+        # 4. Extraer iluminación del beauty y aplicarla al diseño
+        result = SimpleCompositor._blend_with_lighting(beauty, design_applied, effective_mask)
         
         return result
     
@@ -192,7 +204,8 @@ class SimpleCompositor:
             if uv.shape[:2] != (h, w):
                 uv = cv2.resize(uv, (w, h), interpolation=cv2.INTER_NEAREST)
             smooth_masks.append(SimpleCompositor._smooth_mask(m, blur_size=9))
-            prepared.append({'design': z['design'], 'uv_map': uv, 'mask': m,
+            prepared.append({'design': z['design'], 'alpha': z.get('alpha'),
+                             'uv_map': uv, 'mask': m,
                              'region': z['region'], 'aspect_factor': z.get('aspect_factor', 1.0)})
 
         union = np.maximum.reduce(smooth_masks)
@@ -215,6 +228,7 @@ class SimpleCompositor:
         lighting = np.clip(beauty / np.maximum(white_base, 0.01)[np.newaxis, np.newaxis, :], 0.2, 1.0)
 
         design_lit = np.zeros_like(beauty, dtype=np.float32)
+        design_union = np.zeros_like(union)
         for z, sm in zip(prepared, smooth_masks):
             design = z['design']
             design_flipped = np.flipud(design) if flip_vertical else design
@@ -222,9 +236,27 @@ class SimpleCompositor:
                 design_flipped, z['uv_map'], z['mask'],
                 aspect_factor=z['aspect_factor'], region=z['region'],
             )
-            design_lit += dm * lighting * sm[:, :, np.newaxis]
 
-        result = beauty * (1.0 - union[:, :, np.newaxis]) + design_lit
+            z_alpha = z.get('alpha')
+            if z_alpha is not None:
+                alpha_flipped = np.flipud(z_alpha) if flip_vertical else z_alpha
+                am = SimpleCompositor._apply_design_simple(
+                    alpha_flipped[:, :, np.newaxis],
+                    z['uv_map'],
+                    z['mask'],
+                    aspect_factor=z['aspect_factor'],
+                    region=z['region'],
+                )
+                if am.ndim == 3:
+                    am = am[:, :, 0]
+                weight = sm * np.clip(am, 0.0, 1.0)
+            else:
+                weight = sm
+
+            design_lit += dm * lighting * weight[:, :, np.newaxis]
+            design_union = np.maximum(design_union, weight)
+
+        result = beauty * (1.0 - design_union[:, :, np.newaxis]) + design_lit
         result = np.clip(result, 0.0, 1.0)
 
         logger.info(f"✅ Composición SUPERFICIES completada")

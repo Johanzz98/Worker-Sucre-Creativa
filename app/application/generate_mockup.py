@@ -220,12 +220,14 @@ def generate_mockup(
                             logger.info(f"🚫 Zona 'atras' sin diseño trasero -> se omite (queda blanca)")
                             continue
                         z_design = design_back if key == 'atras' else design
+                        z_alpha = design_back_alpha if key == 'atras' else design_alpha
                         z_aspect = float(z.get("aspect_factor", 1.0))
 
                         zone_configs.append({
                             "uv_map": z_uv,
                             "region": region,
                             "design": z_design,
+                            "alpha": z_alpha,
                             "aspect_factor": z_aspect,
                             "key": key,
                         })
@@ -357,7 +359,8 @@ def generate_mockup(
             final_result = SimpleCompositor.create_mockup(
                 beauty, design, uv_abs if uv_abs is not None else uv_map, mask,
                 flip_vertical=flip_vertical,
-                aspect_factor=aspect_factor
+                aspect_factor=aspect_factor,
+                alpha=design_alpha,
             )
 
 
