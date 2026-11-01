@@ -1920,20 +1920,22 @@ class MockupWorker:
 
                     output_filename = f"mockup_{job_id}_{product}_{angle}.jpg"
 
-                    # El PRIMER ángulo es la vista principal (mockupUrls[0], la
-                    # que se guarda en el carrito/orden). Va a más resolución que
-                    # los extras, pero no a 1024/q97: eso pesa ~500 KB y con una
-                    # subida lenta (60 KB/s) son ~8 s de espera para nada (el
-                    # preview se ve a ~500 px). 896/q88 pesa ~200 KB.
-                    # Los demás son solo la galería: 768/q85 (~60 KB).
-                    # Todo configurable por .env.
+                    # Resolución por uso:
+                    # - preview: 1024/q85, suficiente para pantalla.
+                    # - carrito (onlyMain): 1280/q90, miniatura y orden.
+                    # - ángulos extra de una galería no-preview: 1024/q85.
+                    # El compositor nunca agranda: si el Beauty es menor,
+                    # mantiene su tamaño nativo.
                     is_main_angle = (index == 1)
-                    if is_main_angle:
-                        angle_size = int(os.getenv("MOCKUP_MAIN_SIZE", "2048") or 2048)
-                        angle_quality = int(os.getenv("MOCKUP_MAIN_QUALITY", "97") or 97)
+                    if preview:
+                        angle_size = int(os.getenv("MOCKUP_PREVIEW_SIZE", "1024") or 1024)
+                        angle_quality = int(os.getenv("MOCKUP_PREVIEW_QUALITY", "85") or 85)
+                    elif is_main_angle:
+                        angle_size = int(os.getenv("MOCKUP_MAIN_SIZE", "1280") or 1280)
+                        angle_quality = int(os.getenv("MOCKUP_MAIN_QUALITY", "90") or 90)
                     else:
-                        angle_size = int(os.getenv("MOCKUP_PREVIEW_SIZE", "2048") or 2048)
-                        angle_quality = int(os.getenv("MOCKUP_PREVIEW_QUALITY", "97") or 97)
+                        angle_size = int(os.getenv("MOCKUP_PREVIEW_SIZE", "1024") or 1024)
+                        angle_quality = int(os.getenv("MOCKUP_PREVIEW_QUALITY", "85") or 85)
 
                     # Per-mesh: zonas del ángulo actual (máscaras + UVMap propios).
                     angle_zones = zones
@@ -1986,19 +1988,22 @@ class MockupWorker:
                             mockup_key = f"outputs/{mockup_dest_name}"
 
                             if preview:
-                                # Sin R2: se devuelve la imagen en memoria. No
-                                # se publican URLs parciales para no repetir el
-                                # base64 en cada poll del frontend.
+                                # Sin R2: la imagen viaja como data URL. Se
+                                # publica SOLO la primera para que el frontend
+                                # muestre algo en cuanto esté; las demás se
+                                # entregan juntas al completar el job.
                                 url = self._encode_preview_image(mockup_file)
                                 if url:
                                     mockup_slots[index - 1] = url
                                     done = [u for u in mockup_slots if u]
-                                    published[0] = len(done)
-                                    self._update_job_status(
-                                        job_id, "processing",
-                                        f"Generados {len(done)}/{len(angles)} ángulos",
-                                        persist=False, ttl=preview_ttl,
-                                    )
+                                    if published[0] == 0:
+                                        published[0] = 1
+                                        self._update_job_status(
+                                            job_id, "processing",
+                                            f"Generados {len(done)}/{len(angles)} ángulos",
+                                            mockup_urls=[url],
+                                            persist=False, ttl=preview_ttl,
+                                        )
                                 else:
                                     failed_angles.append(angle)
                                 try:
