@@ -889,20 +889,31 @@ class MockupWorker:
         """Ejecuta el UPDATE de mockups/cart_items sobre una conexión dada."""
         cursor = conn.cursor()
 
+        # `processed_at` marca el fin real del job. No debe escribirse cuando
+        # solo pasamos a `processing` al inicio: el frontend lo usa como
+        # completedAt y quedaría con una fecha anterior a la generación.
+        is_terminal = status in ("completed", "failed")
         if mockup_url:
             cursor.execute("""
                 UPDATE mockups 
                 SET status = %s, 
                     mockup_url = %s,
-                    processed_at = NOW(),
+                    processed_at = CASE WHEN %s THEN NOW() ELSE processed_at END,
                     updated_at = NOW()
                 WHERE job_id = %s
-            """, (status, mockup_url, job_id))
-        else:
+            """, (status, mockup_url, is_terminal, job_id))
+        elif is_terminal:
             cursor.execute("""
                 UPDATE mockups 
                 SET status = %s,
                     processed_at = NOW(),
+                    updated_at = NOW()
+                WHERE job_id = %s
+            """, (status, job_id))
+        else:
+            cursor.execute("""
+                UPDATE mockups 
+                SET status = %s,
                     updated_at = NOW()
                 WHERE job_id = %s
             """, (status, job_id))
@@ -1990,31 +2001,12 @@ class MockupWorker:
                             elif self.r2_enabled:
                                 # En paralelo: la subida se solapa con la
                                 # generación del siguiente ángulo.
+                                # La subida corre en paralelo: no bloqueamos la
+                                # generación del siguiente ángulo esperando a
+                                # R2. `_collect_uploads()` publica la primera
+                                # URL en cuanto esté lista.
                                 fut = upload_pool.submit(self._upload_mockup, mockup_file, mockup_key)
                                 upload_futures[fut] = (index - 1, angle)
-
-                                # La vista principal (mockupUrls[0], la del
-                                # carrito) se publica en cuanto termina SU
-                                # subida: no hay que esperar a los otros 3
-                                # ángulos. Antes el aviso salía ~1 s más tarde.
-                                if index == 1:
-                                    try:
-                                        url = fut.result()
-                                    except Exception as exc:
-                                        logger.error(f"❌ Subida {angle}: {exc}")
-                                        url = None
-                                    upload_futures.pop(fut, None)
-                                    if url:
-                                        mockup_slots[0] = url
-                                        done = [u for u in mockup_slots if u]
-                                        published[0] = len(done)
-                                        self._update_job_status(
-                                            job_id, "processing",
-                                            f"Generados {len(done)}/{len(angles)} ángulos",
-                                            mockup_urls=done, persist=False,
-                                        )
-                                    else:
-                                        failed_angles.append(angle)
                             else:
                                 mockup_dest = self.base_storage_path / "outputs" / mockup_dest_name
                                 mockup_dest.parent.mkdir(parents=True, exist_ok=True)
