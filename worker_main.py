@@ -282,6 +282,10 @@ class MockupWorker:
         # Últimos ángulos escritos en BD por producto (evita un UPDATE por job).
         self._angles_cache: Dict[str, List[str]] = {}
 
+        # Mapa valor de ID.png -> zona (primera..sexta) para packs con varias
+        # chapitas. Se calcula una vez por producto usando los masters UV.
+        self._pack_value_map_cache: Dict[str, Dict[str, int]] = {}
+
         self.render_url = os.getenv("RENDER_URL", "http://localhost:8000")
 
         # Modo de generación de mockups: 'compositor' (UVMap + repintado) o
@@ -505,6 +509,192 @@ class MockupWorker:
         except Exception as e:
             logger.warning(f"⚠️ No se pudo leer {id_path}: {e}")
             return False
+
+    def _pack_master_mask(self, product: str, zone_key: str) -> Optional[np.ndarray]:
+        """Silueta de una zona desde su master UVMap_<zona>.exr (sin escribir)."""
+        master = self._product_folder(product) / f"UVMap_{zone_key}.exr"
+        if not master.exists():
+            return None
+        try:
+            uv = UVMapManager.load_uv_map_from_file(str(master), normalize=False)
+            if uv is None:
+                return None
+            u = uv[:, :, 0]
+            v = uv[:, :, 1]
+            mask = (np.abs(u) > 1e-4) | (np.abs(v) > 1e-4)
+            if not mask.any():
+                return None
+            # Un master válido cubre solo su chapita, no todo el frame.
+            if float(mask.mean()) > 0.5:
+                logger.warning(f"⚠️ Master {master.name} cubre casi todo el frame; se ignora para el mapa de zonas")
+                return None
+            return mask
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo leer master {master.name}: {e}")
+            return None
+
+    def _pack_value_map(
+        self,
+        product: str,
+        zone_keys: List[str],
+        reference_angle: str = "centro",
+    ) -> Dict[str, int]:
+        """
+        Relaciona cada zona (primera..sexta) con su valor de gris en ID.png.
+
+        El ID.png del pack trae un nivel por chapita. Los masters UV de cada
+        zona permiten saber qué nivel corresponde a cada key comparando sus
+        siluetas. Si un master es inválido, se completa por eliminación.
+        """
+        cache_key = f"{product}:{','.join(zone_keys)}:{reference_angle}"
+        cached = self._pack_value_map_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        render_path = self.get_render_path(product, reference_angle)
+        id_path = render_path / "ID.png"
+        if not id_path.exists():
+            return {}
+
+        id_img = cv2.imread(str(id_path), cv2.IMREAD_GRAYSCALE)
+        if id_img is None:
+            return {}
+
+        values = sorted(int(v) for v in np.unique(id_img) if int(v) > 0)
+        if len(values) < 2:
+            return {}
+
+        mapping: Dict[str, int] = {}
+        used_values: set[int] = set()
+
+        for key in zone_keys:
+            master_mask = self._pack_master_mask(product, key)
+            if master_mask is None:
+                continue
+
+            if master_mask.shape != id_img.shape:
+                master_mask = cv2.resize(
+                    master_mask.astype(np.uint8),
+                    (id_img.shape[1], id_img.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+
+            best_value = None
+            best_iou = 0.0
+            for value in values:
+                if value in used_values:
+                    continue
+                value_mask = id_img == value
+                inter = np.logical_and(master_mask, value_mask).sum()
+                union = np.logical_or(master_mask, value_mask).sum()
+                if union <= 0:
+                    continue
+                iou = float(inter) / float(union)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_value = value
+
+            if best_value is not None and best_iou >= 0.05:
+                mapping[key] = best_value
+                used_values.add(best_value)
+                logger.info(f"🔗 Zona '{key}' -> ID {best_value} (IoU {best_iou:.3f})")
+
+        # Completar las zonas cuyo master no fue válido con los valores libres.
+        missing_keys = [k for k in zone_keys if k not in mapping]
+        free_values = [v for v in values if v not in used_values]
+        if missing_keys and free_values:
+            for key, value in zip(missing_keys, free_values):
+                mapping[key] = value
+                logger.info(f"🔗 Zona '{key}' -> ID {value} (asignación por orden)")
+
+        self._pack_value_map_cache[cache_key] = dict(mapping)
+        logger.info(f"🗺️ Mapa ID->zona para {product}: {mapping}")
+        return mapping
+
+    def _pack_zones_for_angle(
+        self,
+        product: str,
+        angle: str,
+        zone_keys: List[str],
+    ) -> List[Dict]:
+        """Crea las máscaras de cada chapita para un ángulo desde su ID.png."""
+        if len(zone_keys) < 2:
+            return []
+
+        render_path = self.get_render_path(product, angle)
+        id_path = render_path / "ID.png"
+        uvmap = render_path / "UVMap.exr"
+        if not id_path.exists() or not uvmap.exists():
+            return []
+
+        id_img = cv2.imread(str(id_path), cv2.IMREAD_GRAYSCALE)
+        if id_img is None:
+            return []
+
+        mapping = self._pack_value_map(product, zone_keys)
+        if not mapping:
+            return []
+
+        mask_dir = (
+            self.python_app_path
+            / "data"
+            / "mask-cache"
+            / "pack-zones"
+            / product.replace("/", "_").replace("\\", "_")
+            / angle
+        )
+        mask_dir.mkdir(parents=True, exist_ok=True)
+
+        zones: List[Dict] = []
+        for key in zone_keys:
+            value = mapping.get(key)
+            if value is None:
+                continue
+            mask = (id_img == value).astype(np.uint8) * 255
+            if not mask.any():
+                continue
+            mask_path = mask_dir / f"ID_{key}.png"
+            cv2.imwrite(str(mask_path), mask)
+
+            # UV sintético: el UVMap unificado de estos packs solo trae
+            # coordenadas bajo UNA chapita (las demás quedan en 0,0), y los
+            # masters por zona no siempre están alineados con el ángulo.
+            # Para el preview mapeamos el diseño al bbox de cada máscara.
+            uv_side = 1024
+            h, w = mask.shape[:2]
+            scale = min(1.0, uv_side / float(max(h, w)))
+            uw, uh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+            mask_small = cv2.resize(mask, (uw, uh), interpolation=cv2.INTER_NEAREST) > 127
+            ys, xs = np.where(mask_small)
+            if xs.size == 0:
+                continue
+            x0, x1 = int(xs.min()), int(xs.max())
+            y0, y1 = int(ys.min()), int(ys.max())
+            x_den = max(1, x1 - x0)
+            y_den = max(1, y1 - y0)
+            gx = np.arange(uw, dtype=np.float32)[None, :]
+            gy = np.arange(uh, dtype=np.float32)[:, None]
+            U = np.clip((gx - x0) / float(x_den), 0.0, 1.0)
+            V = np.clip((gy - y0) / float(y_den), 0.0, 1.0)
+            uv_array = np.dstack([
+                np.broadcast_to(U, (uh, uw)),
+                np.broadcast_to(V, (uh, uw)),
+                np.zeros((uh, uw), dtype=np.float32),
+            ]).astype(np.float32)
+
+            zones.append({
+                "key": key,
+                "uvmap": str(uvmap),
+                "uvmap_array": uv_array,
+                "mask": str(mask_path),
+            })
+
+        if zones:
+            logger.info(
+                f"🧩 Pack {product}/{angle}: {len(zones)} zonas desde ID.png "
+                f"{[z['key'] for z in zones]}"
+            )
+        return zones
 
     @staticmethod
     def _derive_zone_mask(master_path: Path, out_png: Path) -> Optional[Path]:
@@ -1590,6 +1780,7 @@ class MockupWorker:
             design_back_active = design_back_key is not None or design_back_url is not None
             frontback = self._has_frontback_masters(product)
             zones = []
+            pack_zone_keys: List[str] = []
             if not frontback:
                 # PACK con ID por sección: las zonas se arman POR ÁNGULO desde su
                 # ID.png (ver loop). NO se derivan máscaras de los masters -> no
@@ -1600,7 +1791,18 @@ class MockupWorker:
                     for angle in angles
                 )
                 if id_pack:
-                    logger.info(f"👇 Producto {product}: zonas por ID.png por ángulo (pack)")
+                    # Si el editor envió diseños individuales por chapita,
+                    # dividir el ID.png por ángulo y aplicar cada diseño. Antes
+                    # esta rama dejaba zones=[] y el mockup usaba un solo
+                    # diseño para todo el pack.
+                    pack_zone_keys = list(zone_designs.keys())
+                    if pack_zone_keys:
+                        logger.info(
+                            f"👇 Producto {product}: pack con {len(pack_zone_keys)} "
+                            f"zonas y diseños propios; se dividirá el ID.png"
+                        )
+                    else:
+                        logger.info(f"👇 Producto {product}: zonas por ID.png por ángulo (pack)")
                 else:
                     surface_masters = self.get_surface_regions(product)
                     if surface_masters:
@@ -1657,9 +1859,19 @@ class MockupWorker:
                         else:
                             angle_zones = self.get_surface_regions(product)
                             logger.warning(f"⚠️ {angle}: sin zonas per-mesh; fallback por región")
-                    # PACK (ID.png con secciones): angle_zones queda [] -> composición
-                    # de UNA sola zona con el ID.png + UVMap.exr del ángulo (sin
-                    # dividir el ID ni crear ID_<key>.png).
+                    # PACK con diseños por chapita: el ID.png tiene una sección
+                    # por zona; se construyen las máscaras de ESTE ángulo.
+                    if pack_zone_keys:
+                        pack_zones = self._pack_zones_for_angle(
+                            product, angle, pack_zone_keys
+                        )
+                        if pack_zones:
+                            angle_zones = pack_zones
+                        else:
+                            logger.warning(
+                                f"⚠️ {angle}: no se pudieron dividir las zonas del pack; "
+                                "se usa el diseño principal"
+                            )
 
                     if render_by_angle and angle in render_by_angle:
                         # Re-render con diseño horneado (textura real, misma que el GLB)

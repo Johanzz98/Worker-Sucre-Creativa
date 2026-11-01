@@ -243,18 +243,27 @@ def generate_mockup(
                     z_uv_path = z.get("uvmap") or uvmap_path
                     z_id_path = z.get("mask")
 
-                    if z_uv_path and not Path(z_uv_path).is_absolute():
-                        z_uv_path = str(Path(render_passes_dir) / z_uv_path)
-                    if (not z_uv_path) and key:
-                        candidate = Path(render_passes_dir) / f"UVMap_{key}.exr"
-                        if candidate.exists():
-                            z_uv_path = str(candidate)
-                    if not z_uv_path:
-                        raise ValueError(f"Zona '{key}': falta uvmap y no existe UVMap_{key}.exr")
+                    # Algunos packs comparten una sola isla UV y el UVMap
+                    # unificado solo trae coordenadas bajo una chapita. El
+                    # worker puede mandar un UV sintético por zona (mapeo
+                    # rectangular dentro de su máscara) para que TODAS reciban
+                    # diseño. Si no viene, se usa el UVMap del archivo.
+                    z_uv_override = z.get("uvmap_array")
+                    if z_uv_override is not None:
+                        z_uv = np.asarray(z_uv_override, dtype=np.float32)
+                    else:
+                        if z_uv_path and not Path(z_uv_path).is_absolute():
+                            z_uv_path = str(Path(render_passes_dir) / z_uv_path)
+                        if (not z_uv_path) and key:
+                            candidate = Path(render_passes_dir) / f"UVMap_{key}.exr"
+                            if candidate.exists():
+                                z_uv_path = str(candidate)
+                        if not z_uv_path:
+                            raise ValueError(f"Zona '{key}': falta uvmap y no existe UVMap_{key}.exr")
 
-                    z_uv = UVMapManager.load_uv_map_from_file(z_uv_path)
-                    if z_uv is None:
-                        raise ValueError(f"Zona '{key}': no se pudo cargar UVMap en {z_uv_path}")
+                        z_uv = UVMapManager.load_uv_map_from_file(z_uv_path)
+                        if z_uv is None:
+                            raise ValueError(f"Zona '{key}': no se pudo cargar UVMap en {z_uv_path}")
 
                     if z_id_path and not Path(z_id_path).is_absolute():
                         z_id_path = str(Path(render_passes_dir) / z_id_path)
@@ -269,6 +278,13 @@ def generate_mockup(
                     if len(z_mask_img.shape) == 3:
                         z_mask_img = np.mean(z_mask_img, axis=2)
                     z_mask = (z_mask_img > 0.1).astype(np.float32)
+
+                    if z_uv.shape[:2] != z_mask.shape[:2]:
+                        z_uv = cv2.resize(
+                            z_uv,
+                            (z_mask.shape[1], z_mask.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
 
                     # Diseño propio de la zona (pack: cada chapita su diseño). Si
                     # no viene, la zona usa el diseño principal (modelo heredado).
