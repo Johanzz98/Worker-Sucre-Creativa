@@ -631,6 +631,14 @@ class MockupWorker:
         if id_img is None:
             return []
 
+        uv_data = UVMapManager.load_uv_map_from_file(str(uvmap), normalize=False)
+        uv_valid = None
+        if uv_data is not None:
+            uv_valid = (
+                (np.abs(uv_data[:, :, 0]) > 1e-4)
+                | (np.abs(uv_data[:, :, 1]) > 1e-4)
+            )
+
         values = sorted(int(v) for v in np.unique(id_img) if int(v) > 0)
         masks_by_key: Dict[str, np.ndarray] = {}
 
@@ -685,38 +693,56 @@ class MockupWorker:
             mask_path = mask_dir / f"ID_{key}.png"
             cv2.imwrite(str(mask_path), mask)
 
-            # UV sintético: el UVMap unificado de estos packs solo trae
-            # coordenadas bajo UNA chapita (las demás quedan en 0,0), y los
-            # masters por zona no siempre están alineados con el ángulo.
-            # Para el preview mapeamos el diseño al bbox de cada máscara.
-            uv_side = 1024
-            h, w = mask.shape[:2]
-            scale = min(1.0, uv_side / float(max(h, w)))
-            uw, uh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
-            mask_small = cv2.resize(mask, (uw, uh), interpolation=cv2.INTER_NEAREST) > 127
-            ys, xs = np.where(mask_small)
-            if xs.size == 0:
-                continue
-            x0, x1 = int(xs.min()), int(xs.max())
-            y0, y1 = int(ys.min()), int(ys.max())
-            x_den = max(1, x1 - x0)
-            y_den = max(1, y1 - y0)
-            gx = np.arange(uw, dtype=np.float32)[None, :]
-            gy = np.arange(uh, dtype=np.float32)[:, None]
-            U = np.clip((gx - x0) / float(x_den), 0.0, 1.0)
-            V = np.clip((gy - y0) / float(y_den), 0.0, 1.0)
-            uv_array = np.dstack([
-                np.broadcast_to(U, (uh, uw)),
-                np.broadcast_to(V, (uh, uw)),
-                np.zeros((uh, uw), dtype=np.float32),
-            ]).astype(np.float32)
+            # Si el UVMap unificado tiene coordenadas reales bajo esta
+            # máscara, usarlo: así el diseño se adapta a la forma de la
+            # chapita. Solo si no hay UV (p.ej. centro con una sola isla
+            # visible) se usa el UV rectangular de respaldo.
+            use_synthetic_uv = True
+            if uv_valid is not None and uv_valid.shape[:2] == mask.shape[:2]:
+                mask_px = int((mask > 127).sum())
+                valid_px = int(np.logical_and(mask > 127, uv_valid).sum())
+                if mask_px > 0 and valid_px / float(mask_px) >= 0.15:
+                    use_synthetic_uv = False
 
-            zones.append({
-                "key": key,
-                "uvmap": str(uvmap),
-                "uvmap_array": uv_array,
-                "mask": str(mask_path),
-            })
+            if use_synthetic_uv:
+                # UV sintético: el UVMap unificado de estos packs solo trae
+                # coordenadas bajo UNA chapita (las demás quedan en 0,0), y los
+                # masters por zona no siempre están alineados con el ángulo.
+                # Para el preview mapeamos el diseño al bbox de cada máscara.
+                uv_side = 1024
+                h, w = mask.shape[:2]
+                scale = min(1.0, uv_side / float(max(h, w)))
+                uw, uh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+                mask_small = cv2.resize(mask, (uw, uh), interpolation=cv2.INTER_NEAREST) > 127
+                ys, xs = np.where(mask_small)
+                if xs.size == 0:
+                    continue
+                x0, x1 = int(xs.min()), int(xs.max())
+                y0, y1 = int(ys.min()), int(ys.max())
+                x_den = max(1, x1 - x0)
+                y_den = max(1, y1 - y0)
+                gx = np.arange(uw, dtype=np.float32)[None, :]
+                gy = np.arange(uh, dtype=np.float32)[:, None]
+                U = np.clip((gx - x0) / float(x_den), 0.0, 1.0)
+                V = np.clip((gy - y0) / float(y_den), 0.0, 1.0)
+                uv_array = np.dstack([
+                    np.broadcast_to(U, (uh, uw)),
+                    np.broadcast_to(V, (uh, uw)),
+                    np.zeros((uh, uw), dtype=np.float32),
+                ]).astype(np.float32)
+
+                zones.append({
+                    "key": key,
+                    "uvmap": str(uvmap),
+                    "uvmap_array": uv_array,
+                    "mask": str(mask_path),
+                })
+            else:
+                zones.append({
+                    "key": key,
+                    "uvmap": str(uvmap),
+                    "mask": str(mask_path),
+                })
 
         if zones:
             logger.info(
