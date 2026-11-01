@@ -631,9 +631,41 @@ class MockupWorker:
         if id_img is None:
             return []
 
-        mapping = self._pack_value_map(product, zone_keys)
-        if not mapping:
-            return []
+        values = sorted(int(v) for v in np.unique(id_img) if int(v) > 0)
+        masks_by_key: Dict[str, np.ndarray] = {}
+
+        if len(values) >= len(zone_keys):
+            mapping = self._pack_value_map(product, zone_keys)
+            if not mapping:
+                return []
+            for key in zone_keys:
+                value = mapping.get(key)
+                if value is None:
+                    continue
+                mask = (id_img == value).astype(np.uint8) * 255
+                if mask.any():
+                    masks_by_key[key] = mask
+        else:
+            # En ángulos laterales/traseros el render ID puede traer un solo
+            # valor (todas las chapitas visibles comparten la misma sección).
+            # Se separan las siluetas por componentes conectados y se asignan
+            # en orden espacial para que ninguna quede sin diseño.
+            binary = (id_img > 0).astype(np.uint8)
+            num, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+            min_area = max(500, int(binary.shape[0] * binary.shape[1] * 0.001))
+            comps = [
+                i for i in range(1, num)
+                if int(stats[i, cv2.CC_STAT_AREA]) >= min_area
+            ]
+            comps.sort(key=lambda i: (float(centroids[i][1]), float(centroids[i][0])))
+            for key, comp in zip(zone_keys, comps):
+                mask = (labels == comp).astype(np.uint8) * 255
+                if mask.any():
+                    masks_by_key[key] = mask
+            logger.info(
+                f"🧩 Pack {product}/{angle}: ID con {len(values)} valor(es); "
+                f"{len(masks_by_key)} zonas separadas por componentes"
+            )
 
         mask_dir = (
             self.python_app_path
@@ -647,11 +679,8 @@ class MockupWorker:
 
         zones: List[Dict] = []
         for key in zone_keys:
-            value = mapping.get(key)
-            if value is None:
-                continue
-            mask = (id_img == value).astype(np.uint8) * 255
-            if not mask.any():
+            mask = masks_by_key.get(key)
+            if mask is None or not mask.any():
                 continue
             mask_path = mask_dir / f"ID_{key}.png"
             cv2.imwrite(str(mask_path), mask)
