@@ -392,8 +392,18 @@ class SimpleCompositor:
             logger.warning(f"⚠️  UV Map dimensions mismatch, resizing from {uv_map.shape[1]}x{uv_map.shape[0]} to {w}x{h}")
             uv_map = cv2.resize(uv_map, (w, h), interpolation=cv2.INTER_LINEAR)
         
-        U = uv_map[:, :, 0]
-        V = uv_map[:, :, 1]
+        # Remapear solo la caja de la máscara. En Chapitas cada zona ocupa
+        # ~1/6 del canvas; remapear el canvas completo 6 veces era el mayor
+        # costo del compositor.
+        ys, xs = np.where(mask > 0.0)
+        if ys.size == 0:
+            return np.zeros((h, w, design.shape[2]), dtype=np.float32)
+
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        uv_crop = uv_map[y0:y1, x0:x1]
+        U = uv_crop[:, :, 0]
+        V = uv_crop[:, :, 1]
         design_h, design_w = design.shape[:2]
         
         # Normalización a la región de la superficie si se define (modelo FRENTE/BACK):
@@ -407,7 +417,7 @@ class SimpleCompositor:
         
         logger.info(f"📏 UV Mapping:")
         logger.info(f"   Design: {design_w}×{design_h}")
-        logger.info(f"   UV Map: {w}×{h}")
+        logger.info(f"   UV Map: {w}×{h} (caja {x1-x0}×{y1-y0})")
         logger.info(f"   UV range: U[{U.min():.3f}, {U.max():.3f}] V[{V.min():.3f}, {V.max():.3f}]")
         logger.info(f"   Aspect factor: {aspect_factor}")
         
@@ -434,6 +444,16 @@ class SimpleCompositor:
         )
         
         remapped_float = remapped.astype(np.float32) / 255.0
+
+        # cv2.remap colapsa un canal (H,W,1 -> H,W). El llamador de alpha
+        # espera 3D para poder indexar am[:, :, 0].
+        if remapped_float.ndim == 2 and design.ndim == 3:
+            remapped_float = remapped_float[:, :, np.newaxis]
+
+        # Solo la caja tiene contenido; el blend posterior ya usa weight=0
+        # fuera de la máscara.
+        result = np.zeros((h, w, design.shape[2]), dtype=np.float32)
+        result[y0:y1, x0:x1] = remapped_float
         
         # ============================================
         # 🔧 FIX 2: MÁSCARA LIMPIA (sin agujeros) Y SIN RELLENO BLANCO
@@ -443,7 +463,7 @@ class SimpleCompositor:
         # ============================================
         logger.info("✅ Diseño mapeado (máscara limpia, sin relleno blanco)")
 
-        return remapped_float
+        return result
     
     @staticmethod
     def _blend_with_lighting(beauty: np.ndarray, design: np.ndarray, 
