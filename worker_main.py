@@ -1783,6 +1783,13 @@ class MockupWorker:
                 logger.error(f"❌ {error_msg}")
                 self._update_job_status(job_id, "failed", error_msg, persist=not preview, ttl=preview_ttl)
                 return False
+
+            # El carrito solo necesita la miniatura principal. El resto de
+            # ángulos son para la previsualización del editor y no se usan en
+            # la personalización guardada.
+            if job_data.get("onlyMain") and len(angles) > 1:
+                logger.info("🎯 onlyMain: se genera solo la vista principal")
+                angles = angles[:1]
             
             logger.info(f"📐 Ángulos a generar: {len(angles)}")
             for angle in angles:
