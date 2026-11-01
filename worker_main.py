@@ -2007,6 +2007,29 @@ class MockupWorker:
                                 # URL en cuanto esté lista.
                                 fut = upload_pool.submit(self._upload_mockup, mockup_file, mockup_key)
                                 upload_futures[fut] = (index - 1, angle)
+
+                                # Si R2 responde rápido (lo normal), publicamos
+                                # la vista principal de inmediato para que el
+                                # carrito no espere los otros 3 ángulos. Si
+                                # tarda, seguimos generando y la recoge
+                                # `_collect_uploads()`.
+                                if index == 1:
+                                    try:
+                                        url = fut.result(timeout=0.6)
+                                    except TimeoutError:
+                                        url = None
+                                    except Exception:
+                                        url = None
+                                    if url:
+                                        upload_futures.pop(fut, None)
+                                        mockup_slots[0] = url
+                                        done = [u for u in mockup_slots if u]
+                                        published[0] = len(done)
+                                        self._update_job_status(
+                                            job_id, "processing",
+                                            f"Generados {len(done)}/{len(angles)} ángulos",
+                                            mockup_urls=done, persist=False,
+                                        )
                             else:
                                 mockup_dest = self.base_storage_path / "outputs" / mockup_dest_name
                                 mockup_dest.parent.mkdir(parents=True, exist_ok=True)
