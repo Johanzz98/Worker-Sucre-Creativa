@@ -533,6 +533,26 @@ class MockupWorker:
             logger.warning(f"⚠️ No se pudo leer master {master.name}: {e}")
             return None
 
+    def _pack_value_map_signature(
+        self,
+        product: str,
+        zone_keys: List[str],
+        reference_angle: str,
+    ) -> str:
+        """Firma de los archivos que definen el mapa ID->zona."""
+        render_path = self.get_render_path(product, reference_angle)
+        paths = [render_path / "ID.png"] + [
+            render_path / f"UVMap_{key}.exr" for key in zone_keys
+        ]
+        parts = []
+        for path in paths:
+            try:
+                st = path.stat()
+                parts.append(f"{path.name}:{st.st_mtime_ns}:{st.st_size}")
+            except Exception:
+                parts.append(f"{path.name}:missing")
+        return "|".join(parts)
+
     def _pack_value_map(
         self,
         product: str,
@@ -546,10 +566,33 @@ class MockupWorker:
         zona permiten saber qué nivel corresponde a cada key comparando sus
         siluetas. Si un master es inválido, se completa por eliminación.
         """
-        cache_key = f"{product}:{','.join(zone_keys)}:{reference_angle}"
+        signature = self._pack_value_map_signature(
+            product, zone_keys, reference_angle
+        )
+        cache_key = (
+            f"{product}:{','.join(zone_keys)}:{reference_angle}:{signature}"
+        )
         cached = self._pack_value_map_cache.get(cache_key)
         if cached is not None:
             return dict(cached)
+
+        # Caché en disco: la primera ejecución tras reiniciar el worker no
+        # tiene que volver a cargar los 6 masters UV ni rehacer el IoU.
+        cache_dir = self.python_app_path / "data" / "cache" / "pack-value-map"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_name = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:20]
+        cache_file = cache_dir / f"{cache_name}.json"
+        try:
+            if cache_file.exists():
+                payload = json.loads(cache_file.read_text(encoding="utf-8"))
+                if payload.get("signature") == signature:
+                    mapping = {k: int(v) for k, v in payload.get("mapping", {}).items()}
+                    if mapping:
+                        self._pack_value_map_cache[cache_key] = dict(mapping)
+                        logger.info(f"🗂️ Mapa ID->zona desde caché: {mapping}")
+                        return mapping
+        except Exception as exc:
+            logger.warning(f"⚠️ No se pudo leer caché de zonas: {exc}")
 
         render_path = self.get_render_path(product, reference_angle)
         id_path = render_path / "ID.png"
@@ -608,6 +651,13 @@ class MockupWorker:
                 logger.info(f"🔗 Zona '{key}' -> ID {value} (asignación por orden)")
 
         self._pack_value_map_cache[cache_key] = dict(mapping)
+        try:
+            cache_file.write_text(
+                json.dumps({"signature": signature, "mapping": mapping}),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.warning(f"⚠️ No se pudo guardar caché de zonas: {exc}")
         logger.info(f"🗺️ Mapa ID->zona para {product}: {mapping}")
         return mapping
 
