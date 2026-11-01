@@ -1597,7 +1597,7 @@ class MockupWorker:
             
             self._update_job_status(
                 job_id, "processing", "Generando mockups...",
-                persist=False, ttl=preview_ttl,
+                persist=not preview, ttl=preview_ttl,
             )
 
             sync_pool = ThreadPoolExecutor(max_workers=1)
