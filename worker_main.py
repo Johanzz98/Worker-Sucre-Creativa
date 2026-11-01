@@ -1730,6 +1730,10 @@ class MockupWorker:
             if zone_designs_data:
                 dl_dir = self.python_app_path / "data" / "downloads"
                 dl_dir.mkdir(parents=True, exist_ok=True)
+
+                # Las descargas de zonas son independientes: en serie costaban
+                # ~0,4 s cada una (2,4 s para 6 chapitas). Se bajan en paralelo.
+                zone_tasks: List[tuple[str, str, Path]] = []
                 for zd in zone_designs_data:
                     z_key = zd.get("key")
                     z_design_key = zd.get("designKey") or zd.get("design_key")
@@ -1749,20 +1753,49 @@ class MockupWorker:
                     elif self.r2_enabled:
                         src = f"{self.r2_config['public_url'].rstrip('/')}/{z_design_key}"
                     else:
-                        src = self.base_storage_path / z_design_key
+                        src = str(self.base_storage_path / z_design_key)
                         if not Path(src).exists():
                             logger.error(f"❌ Diseño de zona '{z_key}' no encontrado: {z_design_key}")
                             self._update_job_status(job_id, "failed", f"Diseño de zona '{z_key}' no encontrado", persist=not preview, ttl=preview_ttl)
                             return False
-                    logger.info(f"⬇️ Descargando diseño de zona '{z_key}': {str(src)[:120]}")
-                    if self._r2_download(str(src), z_path):
-                        zone_designs[z_key] = z_path
-                        logger.info(f"✅ Diseño de zona '{z_key}' descargado: {z_path.name}")
-                    else:
-                        error_msg = f"No se pudo descargar el diseño de zona '{z_key}'"
+                    zone_tasks.append((z_key, str(src), z_path))
+
+                if zone_tasks:
+                    def _fetch_zone(src: str, dest: Path) -> bool:
+                        if src.lower().startswith(("http://", "https://")):
+                            return self._r2_download(src, dest)
+                        local = Path(src)
+                        if not local.exists():
+                            return False
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(local, dest)
+                        return True
+
+                    zone_errors: List[str] = []
+                    with ThreadPoolExecutor(max_workers=min(8, len(zone_tasks))) as pool:
+                        futures = {
+                            pool.submit(_fetch_zone, src, path): (key, path)
+                            for key, src, path in zone_tasks
+                        }
+                        for fut in as_completed(futures):
+                            z_key, z_path = futures[fut]
+                            try:
+                                ok = bool(fut.result())
+                            except Exception as exc:
+                                logger.error(f"❌ Descarga de zona '{z_key}': {exc}")
+                                ok = False
+                            if ok:
+                                zone_designs[z_key] = z_path
+                                logger.info(f"✅ Diseño de zona '{z_key}' descargado: {z_path.name}")
+                            else:
+                                zone_errors.append(z_key)
+
+                    if zone_errors:
+                        error_msg = f"No se pudo descargar el diseño de zona: {', '.join(zone_errors)}"
                         logger.error(f"❌ {error_msg}")
                         self._update_job_status(job_id, "failed", error_msg, persist=not preview, ttl=preview_ttl)
                         return False
+
                 if zone_designs:
                     logger.info(f"✅ Diseños por zona listos: {list(zone_designs.keys())}")
 
