@@ -262,7 +262,7 @@ class MockupWorker:
         # "motas" claras): en un diseño con mucho blanco baja de 52 a 35 motas
         # de 1-9 px frente a q95, y a q98 baja a 18. MOCKUP_OUTPUT_SIZE y
         # MOCKUP_JPEG_QUALITY se pueden cambiar por .env sin tocar código.
-        os.environ.setdefault("MOCKUP_OUTPUT_SIZE", "1024")
+        os.environ.setdefault("MOCKUP_OUTPUT_SIZE", "2048")
         os.environ.setdefault("MOCKUP_JPEG_QUALITY", "97")
 
         # Cache de product_type (1 consulta por producto en vez de 4-5 por job).
@@ -704,6 +704,17 @@ class MockupWorker:
                 if mask_px > 0 and valid_px / float(mask_px) >= 0.15:
                     use_synthetic_uv = False
 
+            # Orientación vertical propia de esta chapita. No se puede usar un
+            # flip global: cada mesh puede tener el eje V al revés.
+            flip_v = False
+            if not use_synthetic_uv and uv_data is not None:
+                ys, xs = np.where(mask > 127)
+                if ys.size > 10:
+                    vv = uv_data[ys, xs, 1]
+                    yy = ys.astype(np.float32)
+                    cov = float(np.cov(vv, yy, bias=True)[0, 1])
+                    flip_v = cov < 0
+
             if use_synthetic_uv:
                 # UV sintético: el UVMap unificado de estos packs solo trae
                 # coordenadas bajo UNA chapita (las demás quedan en 0,0), y los
@@ -736,12 +747,14 @@ class MockupWorker:
                     "uvmap": str(uvmap),
                     "uvmap_array": uv_array,
                     "mask": str(mask_path),
+                    "flip_vertical": flip_v,
                 })
             else:
                 zones.append({
                     "key": key,
                     "uvmap": str(uvmap),
                     "mask": str(mask_path),
+                    "flip_vertical": flip_v,
                 })
 
         if zones:
@@ -1898,11 +1911,11 @@ class MockupWorker:
                     # Todo configurable por .env.
                     is_main_angle = (index == 1)
                     if is_main_angle:
-                        angle_size = int(os.getenv("MOCKUP_MAIN_SIZE", "896") or 896)
-                        angle_quality = int(os.getenv("MOCKUP_MAIN_QUALITY", "88") or 88)
+                        angle_size = int(os.getenv("MOCKUP_MAIN_SIZE", "2048") or 2048)
+                        angle_quality = int(os.getenv("MOCKUP_MAIN_QUALITY", "97") or 97)
                     else:
-                        angle_size = int(os.getenv("MOCKUP_PREVIEW_SIZE", "768") or 768)
-                        angle_quality = int(os.getenv("MOCKUP_PREVIEW_QUALITY", "85") or 85)
+                        angle_size = int(os.getenv("MOCKUP_PREVIEW_SIZE", "2048") or 2048)
+                        angle_quality = int(os.getenv("MOCKUP_PREVIEW_QUALITY", "97") or 97)
 
                     # Per-mesh: zonas del ángulo actual (máscaras + UVMap propios).
                     angle_zones = zones

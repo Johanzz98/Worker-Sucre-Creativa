@@ -84,12 +84,13 @@ def generate_mockup(
         )
         
         # 1. Cargar diseño
-        design = SimplePassLoader._load_image(Path(design_path))
+        design, design_alpha = SimplePassLoader.load_design(Path(design_path))
         logger.info(f"📐 Diseño FRENTE: {design.shape[1]}x{design.shape[0]}")
 
         design_back = None
+        design_back_alpha = None
         if design_back_path:
-            design_back = SimplePassLoader._load_image(Path(design_back_path))
+            design_back, design_back_alpha = SimplePassLoader.load_design(Path(design_back_path))
             logger.info(f"📐 Diseño ATRÁS: {design_back.shape[1]}x{design_back.shape[0]}")
 
         # NOTA: ya NO se recorta al print_zone. El mock usa el canvas completo
@@ -289,17 +290,19 @@ def generate_mockup(
                     # Diseño propio de la zona (pack: cada chapita su diseño). Si
                     # no viene, la zona usa el diseño principal (modelo heredado).
                     z_design = design
+                    z_alpha = design_alpha
                     z_design_path = z.get("design")
                     if z_design_path:
                         if not Path(z_design_path).is_absolute():
                             z_design_path = str(Path(render_passes_dir) / z_design_path)
-                        z_design = SimplePassLoader._load_image(Path(z_design_path))
+                        z_design, z_alpha = SimplePassLoader.load_design(Path(z_design_path))
                         logger.info(f"🎨 Zona '{key}': diseño propio {z_design.shape[1]}x{z_design.shape[0]}")
 
                     # Polera per-mesh: la superficie 'atras' usa el diseño trasero
                     # (design_back). Sin design_back, la espalda queda blanca.
                     if not z_design_path and key == 'atras' and design_back is not None:
                         z_design = design_back
+                        z_alpha = design_back_alpha
                         logger.info("🎨 Zona 'atras': usando diseño trasero (design_back)")
 
                     z_aspect = float(z.get("aspect_factor", aspect_factor))
@@ -329,8 +332,10 @@ def generate_mockup(
                         "uv_map": z_uv,
                         "mask": z_mask,
                         "design": z_design,
+                        "alpha": z_alpha,
                         "aspect_factor": z_aspect,
                         "u_shift": u_shift,
+                        "flip_vertical": bool(z.get("flip_vertical", flip_vertical)),
                     })
 
                 final_result = SimpleCompositor.create_mockup_multi(

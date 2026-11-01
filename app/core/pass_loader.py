@@ -37,6 +37,30 @@ class SimplePassLoader:
     """Carga render passes (PNG, JPG) de Blender"""
     
     @staticmethod
+    def load_design(file_path: Path):
+        """
+        Carga un diseño de usuario conservando su transparencia.
+        Devuelve (rgb [0,1], alpha [0,1]). Si no hay alpha, alpha=1.
+        """
+        p = Path(file_path)
+        img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise ValueError(f"No se pudo cargar diseño: {p}")
+        if img.dtype == np.uint16:
+            img = img.astype(np.float32) / 65535.0
+        else:
+            img = img.astype(np.float32) / 255.0
+
+        if len(img.shape) == 2:
+            return np.dstack([img, img, img]), np.ones(img.shape, dtype=np.float32)
+
+        if img.shape[2] == 4:
+            rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+            return rgba[:, :, :3], rgba[:, :, 3]
+
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), np.ones(img.shape[:2], dtype=np.float32)
+    
+    @staticmethod
     def load_pass(render_passes_dir: str, pass_name: str, required: bool = False) -> Optional[np.ndarray]:
         """
         Busca y carga un render pass por nombre

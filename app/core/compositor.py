@@ -101,6 +101,8 @@ class SimpleCompositor:
                 'mask': m,
                 'u_shift': z.get('u_shift', 0.0),
                 'design': z.get('design', design),
+                'alpha': z.get('alpha'),
+                'flip_vertical': z.get('flip_vertical', flip_vertical),
             })
 
         union = np.maximum.reduce(smooth_masks)
@@ -123,14 +125,34 @@ class SimpleCompositor:
         lighting = np.clip(beauty / np.maximum(white_base, 0.01)[np.newaxis, np.newaxis, :], 0.2, 1.0)
 
         design_lit = np.zeros_like(beauty, dtype=np.float32)
+        design_union = np.zeros_like(union)
         for z, sm in zip(prepared, smooth_masks):
             z_design = z['design']
-            z_design_flipped = np.flipud(z_design) if flip_vertical else z_design
+            z_flip = z.get('flip_vertical', flip_vertical)
+            z_design_flipped = np.flipud(z_design) if z_flip else z_design
             dm = SimpleCompositor._apply_design_simple(z_design_flipped, z['uv_map'], z['mask'], aspect_factor,
                                                        u_shift=z.get('u_shift', 0.0))
-            design_lit += dm * lighting * sm[:, :, np.newaxis]
 
-        result = beauty * (1.0 - union[:, :, np.newaxis]) + design_lit
+            z_alpha = z.get('alpha')
+            if z_alpha is not None:
+                z_alpha_flipped = np.flipud(z_alpha) if z_flip else z_alpha
+                am = SimpleCompositor._apply_design_simple(
+                    z_alpha_flipped[:, :, np.newaxis],
+                    z['uv_map'],
+                    z['mask'],
+                    aspect_factor,
+                    u_shift=z.get('u_shift', 0.0),
+                )
+                if am.ndim == 3:
+                    am = am[:, :, 0]
+                weight = sm * np.clip(am, 0.0, 1.0)
+            else:
+                weight = sm
+
+            design_lit += dm * lighting * weight[:, :, np.newaxis]
+            design_union = np.maximum(design_union, weight)
+
+        result = beauty * (1.0 - design_union[:, :, np.newaxis]) + design_lit
         result = np.clip(result, 0.0, 1.0)
 
         logger.info(f"✅ Composición MULTIZONA completada")
