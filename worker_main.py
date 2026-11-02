@@ -1247,14 +1247,14 @@ class MockupWorker:
     def _encode_preview_image(self, local_path: Path) -> Optional[str]:
         """Devuelve la imagen como data URL para un preview efímero.
 
-        Se reduce a 900 px de lado mayor y calidad 65 para que las 4 vistas
-        quepan holgadas en el estado de Redis y en la respuesta HTTP.
+        Se reduce a 1400 px de lado mayor y calidad 85: mantiene detalle para
+        el preview sin cargar 4 imágenes de 2048 px en Redis/JSON.
         """
         try:
             img = cv2.imread(str(local_path), cv2.IMREAD_COLOR)
             if img is not None:
                 h, w = img.shape[:2]
-                max_dim = 900
+                max_dim = 1400
                 if max(h, w) > max_dim:
                     scale = max_dim / float(max(h, w))
                     img = cv2.resize(
@@ -1262,7 +1262,7 @@ class MockupWorker:
                         (max(1, int(w * scale)), max(1, int(h * scale))),
                         interpolation=cv2.INTER_AREA,
                     )
-                ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 if ok:
                     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
                     return f"data:image/jpeg;base64,{b64}"
@@ -2011,14 +2011,14 @@ class MockupWorker:
                     # mantiene su tamaño nativo.
                     is_main_angle = (index == 1)
                     if preview:
-                        angle_size = int(os.getenv("MOCKUP_PREVIEW_SIZE", "1024") or 1024)
-                        angle_quality = int(os.getenv("MOCKUP_PREVIEW_QUALITY", "85") or 85)
+                        angle_size = int(os.getenv("MOCKUP_PREVIEW_SIZE", "2048") or 2048)
+                        angle_quality = int(os.getenv("MOCKUP_PREVIEW_QUALITY", "90") or 90)
                     elif is_main_angle:
                         angle_size = int(os.getenv("MOCKUP_MAIN_SIZE", "1280") or 1280)
                         angle_quality = int(os.getenv("MOCKUP_MAIN_QUALITY", "90") or 90)
                     else:
-                        angle_size = int(os.getenv("MOCKUP_PREVIEW_SIZE", "1024") or 1024)
-                        angle_quality = int(os.getenv("MOCKUP_PREVIEW_QUALITY", "85") or 85)
+                        angle_size = int(os.getenv("MOCKUP_PREVIEW_SIZE", "2048") or 2048)
+                        angle_quality = int(os.getenv("MOCKUP_PREVIEW_QUALITY", "90") or 90)
 
                     # Per-mesh: zonas del ángulo actual (máscaras + UVMap propios).
                     angle_zones = zones
